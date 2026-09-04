@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+.venv/
+venv/
+
+# 個人設定與存檔
+config.json
+assets_saves/*.json
+*.log
+fgo_screenshot.png
+
+.idea/
+.vscode/
+.DS_Store
