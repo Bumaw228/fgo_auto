@@ -382,7 +382,7 @@ class FGONav:
             bot.capture_screen()
             if bot.find_in_folder('system', 'go_to_interlude_list.png', click_it=False) or \
                bot.find_in_folder('system', 'menu_button.png', click_it=False):
-                return "INIT"
+                break   # 🚀 改用 break，讓下方的周回計數能正常執行
             self.ctx.click(65, 65, times=1, duration=50); self.ctx.smart_sleep(0.2)
 
         if self.ctx.config.get('interlude_mode', False):

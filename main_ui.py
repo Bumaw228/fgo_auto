@@ -7,11 +7,13 @@ import sys
 import cv2
 import subprocess 
 import json 
-from fgo_core import FGOBot 
+from fgo_core import FGOBot, detect_devices
 from fgo_logic import FGOLogic 
 from PIL import Image, ImageTk
 import ctypes
+import webbrowser
 import traceback # 🚀 新增：用來捕捉詳細錯誤訊息
+from updater import check_for_update_async, download_and_apply_async, CURRENT_VERSION
 
 # ==============================
 # 🚀 終極路徑解決方案：防禦 _internal 陷阱與打包路徑問題
@@ -25,6 +27,26 @@ def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 # ==============================
+# 💾 程式層級設定 (記住上次使用的設定檔)
+# ==============================
+CONFIG_PATH = os.path.join(get_base_dir(), "config.json")
+
+def read_app_config():
+    """讀取 config.json，失敗一律回傳空 dict，不影響程式啟動"""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def write_app_config(data):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"⚠️ 寫入 config.json 失敗: {e}")
+
+# ==============================
 # 🌟 設置 CustomTkinter 主題與效能
 # ==============================
 ctk.set_appearance_mode("Dark")
@@ -34,10 +56,12 @@ ctk.deactivate_automatic_dpi_awareness()
 ctk.set_window_scaling(1.0)
 ctk.set_widget_scaling(1.0)
 
+
+
 class FGOApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("FGO 好玩遊戲輔助工具")
+        self.root.title(f"FGO 好玩遊戲輔助工具 v{CURRENT_VERSION}")
         self.root.geometry("700x850") 
         self.root.minsize(650, 800)
         
@@ -110,6 +134,11 @@ class FGOApp:
 
         self.setup_ui()
         self.update_dynamic_status()
+
+        # 🚀 自動載入上次使用的設定檔
+        self.auto_load_last_profile()
+        # 🚀 延遲 1.5 秒再檢查更新，讓視窗先畫完再說
+        self.root.after(1500, self.check_update)
 
     def toggle_extreme_sleep_ui(self, *args):
         if hasattr(self, 'entry_extreme_sleep') and self.entry_extreme_sleep:
@@ -413,17 +442,9 @@ class FGOApp:
             os.makedirs(d, exist_ok=True)
             fp = filedialog.asksaveasfilename(initialdir=d, defaultextension=".json", filetypes=[("FGO 腳本檔", "*.json")])
             if not fp: return
-            data = {
-                'battle_mode': self.battle_mode.get(), 'smart_turn_mode': self.smart_turn_mode.get(),
-                'skill_mode': self.skill_mode.get(), 'extreme_sleep': self.extreme_sleep.get(), 
-                'apple_mode': self.apple_mode.get(), 'loop_target': self.loop_target.get(),
-                'support_class': self.support_class.get(), 'target_servant_paths': self.target_servant_paths, 
-                'target_ce_paths': self.target_ce_paths, 'team_index': int(self.team_index.get()),
-                'script_data': self.script_data, 'auto_formation': self.auto_formation.get(),
-                'interlude_mode': self.interlude_mode.get(), 'ai_card_mode': self.ai_card_mode.get(),
-                'card_priority': self.card_priority.get(), 'auto_np_mode': self.auto_np_mode.get()
-            }
+            data = self._collect_profile_data()
             with open(fp, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=4)
+            write_app_config({'last_profile': fp})   # 🚀 記住這次存到哪，下次開機自動載入
             messagebox.showinfo("成功", "設定已成功儲存！")
             self.update_status_label(f"狀態：已儲存設定 ({os.path.basename(fp)})", "#28a745")
         except Exception as e: 
@@ -437,35 +458,123 @@ class FGOApp:
             if not fp: return
             
             with open(fp, 'r', encoding='utf-8') as f: data = json.load(f)
-            self.battle_mode.set(data.get('battle_mode', 'script'))
-            self.smart_turn_mode.set(data.get('smart_turn_mode', False))
-            self.skill_mode.set(data.get('skill_mode', "智慧安全"))
-            self.extreme_sleep.set(str(data.get('extreme_sleep', '2.5')))
-            self.apple_mode.set(data.get('apple_mode', '不自動回體'))
-            self.loop_target.set(str(data.get('loop_target', '0')))
-            self.support_class.set(data.get('support_class', 'ALL'))
-            
-            paths_s = data.get('target_servant_paths', [None, None, None])
-            for i in range(3):
-                self.target_servant_paths[i] = paths_s[i] if i < len(paths_s) else None
-                self.selected_servants[i].set(os.path.basename(paths_s[i]) if i < len(paths_s) and paths_s[i] else "尚未選取")
-
-            paths_c = data.get('target_ce_paths', [None, None, None])
-            for i in range(3):
-                self.target_ce_paths[i] = paths_c[i] if i < len(paths_c) else None
-                self.selected_ces[i].set(os.path.basename(paths_c[i]) if i < len(paths_c) and paths_c[i] else "尚未選取")
-
-            self.team_index.set(str(data.get('team_index', 1))) 
-            self.auto_formation.set(data.get('auto_formation', False))
-            self.interlude_mode.set(data.get('interlude_mode', False))
-            self.ai_card_mode.set(data.get('ai_card_mode', False))
-            self.card_priority.set(data.get('card_priority', "無"))
-            self.auto_np_mode.set(data.get('auto_np_mode', True))
-            self.script_data = data.get('script_data', [[], [], []])
-            self.update_script_display() 
+            self._apply_profile_data(data)
+            write_app_config({'last_profile': fp})   # 🚀 記住這次讀了哪個檔
             self.update_status_label(f"狀態：已載入設定 ({os.path.basename(fp)})", "#28a745")
         except Exception as e: 
             messagebox.showerror("讀檔失敗", traceback.format_exc())
+
+    # ==============================
+    # 💾 設定檔的收集 / 套用 (存檔、讀檔、自動載入共用)
+    # ==============================
+    def _collect_profile_data(self):
+        """把目前 UI 上的所有設定收集成 dict"""
+        return {
+            'device_id': self.entry_adb.get(),
+            'battle_mode': self.battle_mode.get(), 'smart_turn_mode': self.smart_turn_mode.get(),
+            'skill_mode': self.skill_mode.get(), 'extreme_sleep': self.extreme_sleep.get(),
+            'apple_mode': self.apple_mode.get(), 'loop_target': self.loop_target.get(),
+            'support_class': self.support_class.get(), 'target_servant_paths': self.target_servant_paths,
+            'target_ce_paths': self.target_ce_paths, 'team_index': int(self.team_index.get()),
+            'script_data': self.script_data, 'auto_formation': self.auto_formation.get(),
+            'interlude_mode': self.interlude_mode.get(), 'ai_card_mode': self.ai_card_mode.get(),
+            'card_priority': self.card_priority.get(), 'auto_np_mode': self.auto_np_mode.get()
+        }
+
+    def _apply_profile_data(self, data):
+        """把 dict 套用回 UI。所有欄位都用 .get() 附預設值，舊版存檔也能正常讀取"""
+        dev = data.get('device_id')
+        if dev:
+            self.entry_adb.delete(0, tk.END)
+            self.entry_adb.insert(0, dev)
+
+        self.battle_mode.set(data.get('battle_mode', 'script'))
+        self.smart_turn_mode.set(data.get('smart_turn_mode', False))
+        self.skill_mode.set(data.get('skill_mode', "智慧安全"))
+        self.extreme_sleep.set(str(data.get('extreme_sleep', '2.5')))
+        self.apple_mode.set(data.get('apple_mode', '不自動回體'))
+        self.loop_target.set(str(data.get('loop_target', '0')))
+        self.support_class.set(data.get('support_class', 'ALL'))
+
+        # 🚀 滑桿不會跟著 StringVar 連動，必須手動同步位置
+        try:
+            self.entry_extreme_sleep.set(float(self.extreme_sleep.get()))
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        paths_s = data.get('target_servant_paths', [None, None, None])
+        paths_c = data.get('target_ce_paths', [None, None, None])
+        for i in range(3):
+            self.target_servant_paths[i] = paths_s[i] if i < len(paths_s) else None
+            self.selected_servants[i].set(
+                os.path.basename(paths_s[i]) if i < len(paths_s) and paths_s[i] else "尚未選取")
+            self.target_ce_paths[i] = paths_c[i] if i < len(paths_c) else None
+            self.selected_ces[i].set(
+                os.path.basename(paths_c[i]) if i < len(paths_c) and paths_c[i] else "尚未選取")
+
+        self.team_index.set(str(data.get('team_index', 1)))
+        self.auto_formation.set(data.get('auto_formation', False))
+        self.interlude_mode.set(data.get('interlude_mode', False))
+        self.ai_card_mode.set(data.get('ai_card_mode', False))
+        self.card_priority.set(data.get('card_priority', "無"))
+        self.auto_np_mode.set(data.get('auto_np_mode', True))
+        self.script_data = data.get('script_data', [[], [], []])
+        self.update_script_display()
+
+    def auto_load_last_profile(self):
+        """開機時自動套用上次使用的設定檔。任何失敗都只印訊息，不打斷啟動"""
+        fp = read_app_config().get('last_profile')
+        if not fp or not os.path.exists(fp):
+            return
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                self._apply_profile_data(json.load(f))
+            self.update_status_label(f"狀態：已自動載入 ({os.path.basename(fp)})", "#28a745")
+            print(f"💾 已自動載入上次設定: {fp}")
+        except Exception as e:
+            print(f"⚠️ 自動載入設定失敗，將使用預設值: {e}")
+
+    # ==============================
+    # 🔄 自動更新
+    # ==============================
+    def check_update(self):
+        check_for_update_async(
+            lambda info: self.root.after(0, lambda: self._ask_update(info)),
+            on_error=lambda msg: print(f"[更新檢查] 略過：{msg}")
+        )
+
+    def _ask_update(self, info):
+        notes = info["notes"]
+        if len(notes) > 400:
+            notes = notes[:400] + "\n..."
+        size_txt = ""
+        if info.get("zip"):
+            size_txt = f"\n更新檔大小：{info['zip']['size'] / 1024 / 1024:.1f} MB"
+        msg = (f"目前版本：v{CURRENT_VERSION}\n"
+               f"最新版本：{info['version']}{size_txt}\n\n"
+               f"{notes}\n\n"
+               f"要現在自動更新嗎？\n（程式會關閉，更新完成後自動重新開啟）")
+        if messagebox.askyesno("🎉 有新版本可用", msg):
+            self._start_update(info)
+
+    def _start_update(self, info):
+        self.stop_script()
+        for b in (self.btn_start, self.btn_save, self.btn_load):
+            b.configure(state="disabled")
+
+        def on_fail(m):
+            messagebox.showerror("更新失敗", f"{m}\n\n將為您開啟下載頁面，請手動更新。")
+            webbrowser.open(info["page"])
+            self.btn_start.configure(state="normal")
+            self.btn_save.configure(state="normal")
+            self.btn_load.configure(state="normal")
+
+        download_and_apply_async(
+            info,
+            on_progress=lambda p: self.update_status_label(f"狀態：下載更新中... {p}%", "orange"),
+            on_ready=lambda: self.root.after(0, self.root.destroy),
+            on_error=lambda m: self.root.after(0, lambda: on_fail(m))
+        )
 
     def update_status_label(self, text, color="#00CFFF"):
         self.root.after(0, lambda: self.label_status.configure(text=text, text_color=color))
@@ -504,7 +613,7 @@ class FGOApp:
                 }
                 
                 self.logic_thread = FGOLogic(config, self.update_status_label, self.stop_script)
-                self.logic_thread.bot.init_device()
+                #self.logic_thread.bot.init_device()
                 
                 # 獨立執行緒執行大腦，若出錯也能被抓到
                 def thread_worker():
@@ -538,30 +647,35 @@ class FGOApp:
             self.label_status.configure(text="狀態：已停止", text_color="#dc3545")
 
     def detect_adb(self):
-        try:
-            self.update_status_label("狀態：正在偵測設備...", "white"); self.root.update()
-            result = subprocess.run("adb devices", capture_output=True, text=True, shell=True)
-            lines = result.stdout.strip().split('\n')[1:]
-            devices = [line.split('\t')[0] for line in lines if 'device' in line]
-            if not devices:
-                self.update_status_label("狀態：重置 ADB 伺服器中...", "orange"); self.root.update()
-                subprocess.run("adb kill-server", shell=True, capture_output=True)
-                subprocess.run("adb start-server", shell=True, capture_output=True)
-                result = subprocess.run("adb devices", capture_output=True, text=True, shell=True)
-                lines = result.stdout.strip().split('\n')[1:]
-                devices = [line.split('\t')[0] for line in lines if 'device' in line]
-            if devices: 
-                self.entry_adb.delete(0, tk.END); self.entry_adb.insert(0, devices[0])
-                self.led_indicator.configure(text_color="#28a745") 
-                self.update_status_label(f"狀態：ADB 連線成功 ({devices[0]})", "#28a745")
-                messagebox.showinfo("成功", f"已連線: {devices[0]}")
-            else:
-                self.led_indicator.configure(text_color="#dc3545")
-                self.update_status_label("狀態：找不到設備，請確認模擬器設定", "#dc3545")
-                messagebox.showwarning("找不到設備", "請確認模擬器已開啟，且「ADB 偵錯」已啟用。")
-        except Exception as e: 
+        """自動偵測模擬器（在背景執行緒跑，避免視窗假死）"""
+        self.update_status_label("狀態：正在偵測設備...", "white")
+
+        def worker():
+            try:
+                devices = detect_devices(
+                    status_cb=lambda msg: self.update_status_label(f"狀態：{msg}", "orange")
+                )
+            except Exception:
+                err = traceback.format_exc()
+                self.root.after(0, lambda: messagebox.showerror("ADB 執行錯誤", err))
+                return
+            self.root.after(0, lambda: self._apply_detect_result(devices))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_detect_result(self, devices):
+        if devices:
+            self.entry_adb.delete(0, tk.END)
+            self.entry_adb.insert(0, devices[0])
+            self.led_indicator.configure(text_color="#28a745")
+            self.update_status_label(f"狀態：ADB 連線成功 ({devices[0]})", "#28a745")
+            extra = f"\n(共偵測到 {len(devices)} 台，已選用第一台)" if len(devices) > 1 else ""
+            messagebox.showinfo("成功", f"已連線: {devices[0]}{extra}")
+        else:
             self.led_indicator.configure(text_color="#dc3545")
-            messagebox.showerror("ADB 執行錯誤", traceback.format_exc())
+            self.update_status_label("狀態：找不到設備，請確認模擬器設定", "#dc3545")
+            messagebox.showwarning("找不到設備",
+                "請確認模擬器已開啟，且已在模擬器設定中啟用「ADB 偵錯 / Root」。")
 
     def test_connection(self):
         self.test_screenshot()
@@ -605,17 +719,8 @@ class FGOApp:
         except Exception as e:
             messagebox.showerror("圖片儲存失敗", traceback.format_exc())
 
-# 🚀 啟動前讀取 config，也必須使用絕對路徑
-def load_initial_config():
-    config_path = os.path.join(get_base_dir(), "config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                pass # 這裡只是測試讀取
-        except: pass
-
 if __name__ == "__main__":
-    load_initial_config()
     root = ctk.CTk()
     app = FGOApp(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: (app.stop_script(), root.destroy()))
     root.mainloop()

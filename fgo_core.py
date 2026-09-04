@@ -1,195 +1,416 @@
 import os
+import sys
 import subprocess
-import cv2
-import sys  # 🚀 新增 sys 模組
-import numpy as np
 import re
+from collections import OrderedDict
+
+import cv2
+import numpy as np
+
+# ==========================================
+# 🔧 全域設定
+# ==========================================
+
+# Windows 專用旗標：讓 subprocess 不要閃出黑色命令視窗
+CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
+# 🐞 除錯開關：正式發布時改成 False，可大幅減少主控台 I/O、加快主迴圈
+DEBUG = True
+
+# 只有列在這裡的圖片，在 DEBUG 模式下才會印出相似度
+DEBUG_TEMPLATES = {
+    'ap_recovery_check.png', 'attack.png', 'battle_start.png', 'blue_apple.png',
+    'bond_ce_close.png', 'bond_screen.png', 'bronze_apple.png', 'close_btn.png',
+    'close_x.png', 'continue_battle.png', 'decide_btn.png', 'drop_screen.png',
+    'exp_screen.png', 'friend_request.png', 'gold_apple.png', 'menu_button.png',
+    'network_retry.png', 'next_btn.png', 'quest_start.png', 'refresh_btn.png',
+    'refresh_yes.png', 'reject_friend.png', 'silver_apple.png', 'sp_no_star.png',
+    'sp_use_star.png', 'sp_use_star_disabled.png', 'support_check.png',
+    'support_update.png', 'team_confirm.png', 'turn_1.png', 'turn_2.png', 'turn_3.png',
+    'select_target_text.png', 'order_change_btn.png', 'order_change_confirm_btn.png',
+    'retreat_btn.png', 'retreat_decide_btn.png', 'servant_detail_close_x.png',
+    'mission_start.png', 'inventory_full_close.png', 'back_btn.png', 'fgo_icon.png',
+    'class_all.png', 'class_saber.png', 'class_archer.png', 'class_lancer.png',
+    'class_rider.png', 'class_caster.png', 'class_assassin.png', 'class_berserker.png',
+    'class_extra.png', 'class_mix.png',
+    'auto_form_btn1.png', 'auto_form_btn2.png', 'auto_form_btn3.png',
+    'skip_confirm.png', 'go_to_story_stage.png', 'interlude_active.png',
+    'go_to_interlude_list.png', 'formation_limit.png', 'mandatory_slot.png',
+    'select_from_support.png',
+}
+
+# 邏輯運算用的基準畫布（所有座標都以此為準）
+CANVAS_W = 1920
+CANVAS_H = 1080
+
+# 影像快取上限（張數）
+TEMPLATE_CACHE_SIZE = 60
 
 
 def get_base_dir():
+    """取得程式所在目錄，PyInstaller 打包後也能正確指向 exe 外層。"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
+
+def _resolve_adb():
+    """優先使用專案內建的 adb，找不到才退回系統 PATH。
+
+    這樣使用者不需要自己安裝 Android SDK 或設定環境變數。
+    注意 adb.exe 旁邊必須有 AdbWinApi.dll 與 AdbWinUsbApi.dll，缺一不可。
+    """
+    base = get_base_dir()
+    candidates = [
+        os.path.join(base, "platform-tools", "adb.exe"),
+        os.path.join(base, "adb.exe"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            print(f"[INIT] 使用內建 ADB: {p}")
+            return p
+    print("[INIT] 未找到內建 ADB，改用系統 PATH")
+    return "adb"
+
+
+# 全專案共用同一個 adb 路徑，main_ui.py 也要 import 這個常數
+ADB_EXE = _resolve_adb()
+
+# 常見模擬器的 ADB 連接埠，自動偵測失敗時會逐一嘗試連線
+COMMON_ADB_PORTS = [
+    "127.0.0.1:5555",    # 通用 / MuMu
+    "127.0.0.1:7555",    # MuMu 舊版
+    "127.0.0.1:16384",   # MuMu 12
+    "127.0.0.1:62001",   # 夜神 Nox
+    "127.0.0.1:21503",   # 逍遙 Memu
+    "127.0.0.1:5037",
+]
+
+
+def _run_adb(args, timeout=15):
+    """執行不指定裝置的 adb 指令（devices / connect / kill-server 等）。"""
+    try:
+        return subprocess.run(
+            [ADB_EXE] + args, capture_output=True, text=True,
+            timeout=timeout, creationflags=CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        print(f"⚠️ [ADB] {' '.join(args)} 失敗: {e}")
+        return subprocess.CompletedProcess(args, 1, '', '')
+
+
+def list_devices():
+    """回傳目前已連線且狀態正常的裝置清單。"""
+    out = _run_adb(["devices"]).stdout or ""
+    devices = []
+    for line in out.strip().splitlines()[1:]:      # 第一行是標題，略過
+        parts = line.split('\t')
+        # 只收 state 為 device 的，排除 offline / unauthorized
+        if len(parts) == 2 and parts[1].strip() == "device":
+            devices.append(parts[0].strip())
+    return devices
+
+
+def detect_devices(status_cb=None):
+    """自動偵測模擬器，供 UI 的「自動偵測」按鈕使用。
+
+    依序嘗試：直接列舉 → 主動連線常見埠 → 重啟 adb 伺服器後再試。
+    status_cb 是選用的回呼，用來即時更新 UI 文字。
+    """
+    def report(msg):
+        print(f"[偵測] {msg}")
+        if status_cb:
+            status_cb(msg)
+
+    devices = list_devices()
+    if devices:
+        return devices
+
+    # 有些模擬器不會自動註冊，必須主動 connect 才看得到
+    report("嘗試連線常見模擬器連接埠...")
+    for port in COMMON_ADB_PORTS:
+        _run_adb(["connect", port], timeout=8)
+    devices = list_devices()
+    if devices:
+        return devices
+
+    # 最後手段：重啟伺服器（版本衝突時通常能救回來）
+    report("重置 ADB 伺服器中...")
+    _run_adb(["kill-server"], timeout=10)
+    _run_adb(["start-server"], timeout=20)
+    for port in COMMON_ADB_PORTS:
+        _run_adb(["connect", port], timeout=8)
+    return _verify(list_devices())
+
+def _verify(devices):
+    """實際驗證每台裝置是否真的能用，排除殘留的死連線。"""
+    alive = []
+    for d in devices:
+        r = _run_adb(["-s", d, "shell", "wm", "size"], timeout=6)
+        if r.stdout and "x" in r.stdout:
+            alive.append(d)
+        else:
+            print(f"[偵測] {d} 無回應，已排除")
+    return alive or devices   # 全部都不通的話還是回傳原清單，讓使用者自己試
+
+
 class FGOBot:
+    """負責與模擬器溝通的底層：截圖、點擊、影像比對。"""
+
     def __init__(self, device_id="127.0.0.1:5555"):
         self.device_id = device_id
-        
-        # 🚀 關鍵修復：這裡原本是 __file__，現在換成 get_base_dir()
         self.base_dir = get_base_dir()
-        #self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.sys_path = os.path.join(self.base_dir, "assets_system")
         self.friend_path = os.path.join(self.base_dir, "assets_friends")
-        
+
         self.current_screen = None
         self.current_screen_gray = None
-        self.template_cache = {}
 
-        # 🌟 融合 ChatGPT 的神級架構：三層座標系
-        self.raw_w = 1920
-        self.raw_h = 1080
-        self.tap_w = 1920
-        self.tap_h = 1080
-        
+        # 用 OrderedDict 實作 LRU，滿了只踢掉最久沒用的一張，不再整批清空
+        self.template_cache = OrderedDict()
+        self._missing_warned = set()   # 已經警告過的缺圖，避免洗版
+
+        # 座標系：截圖解析度 (raw) 與裝置觸控解析度 (tap)
+        self.raw_w = CANVAS_W
+        self.raw_h = CANVAS_H
+        self.tap_w = CANVAS_W
+        self.tap_h = CANVAS_H
+
+        self._use_exec_out = True   # 先試 exec-out，失敗再退回 shell screencap
+
         os.makedirs(self.sys_path, exist_ok=True)
         os.makedirs(os.path.join(self.friend_path, "servants"), exist_ok=True)
         os.makedirs(os.path.join(self.friend_path, "craft_essences"), exist_ok=True)
 
         self.init_device()
 
-    def adb_shell(self, command):
-        cmd = f"adb -s {self.device_id} {command}"
-        return subprocess.run(cmd, shell=True, capture_output=True)
+    # ==========================================
+    # 🔌 ADB 底層
+    # ==========================================
+    def adb_shell(self, command, timeout=15):
+        """執行 adb 指令。
+
+        不使用 shell=True：少一層 cmd.exe、不會閃黑窗、也比較快。
+        逾時會強制殺掉卡住的 adb 客戶端行程，避免 adb.exe 越積越多。
+        """
+        cmd = [ADB_EXE, "-s", self.device_id] + command.split()
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, timeout=timeout,
+                creationflags=CREATE_NO_WINDOW
+            )
+        except subprocess.TimeoutExpired:
+            print(f"⚠️ [ADB] 指令逾時已強制中斷: {command}")
+        except FileNotFoundError:
+            print("❌ [ADB] 找不到 adb 執行檔，請確認已加入系統 PATH")
+        except Exception as e:
+            print(f"⚠️ [ADB] 執行失敗: {e}")
+        # 統一回傳一個「失敗但結構完整」的物件，呼叫端不用額外判 None
+        return subprocess.CompletedProcess(cmd, 1, b'', b'')
 
     def init_device(self):
-        """⭐ 獲取設備真實的觸控解析度 (防禦 MuMu 等模擬器顯示與觸控不一)"""
-        result = self.adb_shell("shell wm size")
-        out = result.stdout.decode()
-        m = re.search(r'(\d+)x(\d+)', out)
-        if m:
-            w = int(m.group(1))
-            h = int(m.group(2))
-            # 強制轉成橫向
-            if h > w:
-                w, h = h, w
-            self.tap_w = w
-            self.tap_h = h
-            print(f"[INIT] 觸控真實解析度 (Tap Resolution): {self.tap_w}x{self.tap_h}")
+        """讀取裝置真實觸控解析度，防禦模擬器顯示與觸控不一致的問題。"""
+        result = self.adb_shell("shell wm size", timeout=10)
+        out = result.stdout.decode(errors='ignore')
 
+        # 有 Override size 時要以它為準，input 事件吃的是覆寫後的解析度
+        matches = re.findall(r'(\d+)x(\d+)', out)
+        if matches:
+            w, h = int(matches[-1][0]), int(matches[-1][1])
+            if h > w:
+                w, h = h, w   # 強制轉成橫向
+            self.tap_w, self.tap_h = w, h
+            print(f"[INIT] 觸控解析度: {self.tap_w}x{self.tap_h}")
+        else:
+            print(f"[INIT] 無法讀取解析度，沿用預設 {self.tap_w}x{self.tap_h}")
+
+    def shutdown(self):
+        """關閉 adb 伺服器。
+
+        注意：kill-server 是全域的，會影響其他正在使用 adb 的程式
+        （scrcpy、Android Studio 等），而且模擬器通常會自己再叫起來。
+        建議做成使用者可選的開關，不要無條件呼叫。
+        """
+        try:
+            subprocess.run([ADB_EXE, "kill-server"], capture_output=True,
+                           timeout=10, creationflags=CREATE_NO_WINDOW)
+            print("🔌 [ADB] 伺服器已關閉")
+        except Exception as e:
+            print(f"⚠️ [ADB] 關閉伺服器失敗: {e}")
+
+    # ==========================================
+    # 📸 截圖
+    # ==========================================
     def capture_screen(self):
-        result = self.adb_shell("shell screencap -p")
-        if not result.stdout:
+        """擷取畫面並正規化成 1920x1080 供邏輯判斷。"""
+        raw_bytes = None
+
+        # exec-out 走 binary 通道，不會有換行被轉譯的問題，也比較快
+        if self._use_exec_out:
+            result = self.adb_shell("exec-out screencap -p", timeout=15)
+            if result.stdout:
+                raw_bytes = result.stdout
+            else:
+                print("⚠️ [截圖] exec-out 無回應，改用 shell screencap")
+                self._use_exec_out = False
+
+        if raw_bytes is None:
+            result = self.adb_shell("shell screencap -p", timeout=15)
+            if not result.stdout:
+                self.current_screen = None
+                self.current_screen_gray = None
+                return False
+            # 舊路徑要手動修掉被轉譯的換行（有些裝置是 \r\r\n）
+            raw_bytes = result.stdout.replace(b'\r\r\n', b'\n').replace(b'\r\n', b'\n')
+
+        raw_img = cv2.imdecode(np.frombuffer(raw_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if raw_img is None:
+            # exec-out 解碼失敗的話，下次自動退回舊方式再試
+            if self._use_exec_out:
+                self._use_exec_out = False
+                print("⚠️ [截圖] 解碼失敗，下次改用 shell screencap")
             self.current_screen = None
             self.current_screen_gray = None
             return False
-            
-        img_data = result.stdout.replace(b'\r\n', b'\n')
-        raw_img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
-        if raw_img is None: return False
-        
+
         self.raw_h, self.raw_w = raw_img.shape[:2]
-        
-        # 畫布歸一化：永遠縮放回 1920x1080 給邏輯判斷
-        if (self.raw_w, self.raw_h) != (1920, 1080):
-            self.current_screen = cv2.resize(raw_img, (1920, 1080))
+
+        if (self.raw_w, self.raw_h) != (CANVAS_W, CANVAS_H):
+            # 縮小用 INTER_AREA 畫質最好，模板比對分數會比較穩
+            interp = cv2.INTER_AREA if self.raw_w > CANVAS_W else cv2.INTER_LINEAR
+            self.current_screen = cv2.resize(raw_img, (CANVAS_W, CANVAS_H), interpolation=interp)
         else:
             self.current_screen = raw_img
-            
+
         self.current_screen_gray = cv2.cvtColor(self.current_screen, cv2.COLOR_BGR2GRAY)
         return True
 
+    # ==========================================
+    # 👆 座標轉譯與操作
+    # ==========================================
+    def _to_tap(self, x, y):
+        """把 1920x1080 基準座標換算成裝置實際觸控座標。"""
+        tx = round(x / float(CANVAS_W) * self.tap_w)
+        ty = round(y / float(CANVAS_H) * self.tap_h)
+        # 夾在畫面範圍內，避免傳出無效座標
+        tx = max(0, min(self.tap_w - 1, tx))
+        ty = max(0, min(self.tap_h - 1, ty))
+        return tx, ty
+
     def smart_click(self, x, y, duration=150):
-        """🌟 融合版：三層虛擬座標轉譯器"""
-        if self.raw_w == 0 or self.raw_h == 0: return
-
-        # 1. 1080p 座標 -> 截圖相對座標
-        rx = int((x / 1920.0) * self.raw_w)
-        ry = int((y / 1080.0) * self.raw_h)
-        
-        # 2. 截圖座標 -> 設備觸控座標
-        tx = int((rx / self.raw_w) * self.tap_w)
-        ty = int((ry / self.raw_h) * self.tap_h)
-
-        self.adb_shell(f"shell input swipe {tx} {ty} {tx} {ty} {duration}")
+        tx, ty = self._to_tap(x, y)
+        # 用 swipe 原地不動來模擬點擊，可精確控制按壓時間
+        self.adb_shell(f"shell input swipe {tx} {ty} {tx} {ty} {duration}", timeout=5)
 
     def smart_swipe(self, x1, y1, x2, y2, duration=400):
-        def convert(x, y):
-            rx = int((x / 1920.0) * self.raw_w)
-            ry = int((y / 1080.0) * self.raw_h)
-            tx = int((rx / self.raw_w) * self.tap_w)
-            ty = int((ry / self.raw_h) * self.tap_h)
-            return tx, ty
+        tx1, ty1 = self._to_tap(x1, y1)
+        tx2, ty2 = self._to_tap(x2, y2)
+        self.adb_shell(f"shell input swipe {tx1} {ty1} {tx2} {ty2} {duration}", timeout=10)
 
-        tx1, ty1 = convert(x1, y1)
-        tx2, ty2 = convert(x2, y2)
-        self.adb_shell(f"shell input swipe {tx1} {ty1} {tx2} {ty2} {duration}")
-
-    #def _get_template_gray(self, full_path):
-    #    if full_path not in self.template_cache:
-    #        template_color = cv2.imdecode(np.fromfile(full_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-    #        if template_color is None: return None
-    #        self.template_cache[full_path] = cv2.cvtColor(template_color, cv2.COLOR_BGR2GRAY)
-    #    return self.template_cache[full_path]
-    
+    # ==========================================
+    # 🔍 影像比對
+    # ==========================================
     def _get_template_gray(self, full_path):
-        # 🚀 效能保護：如果快取超過 50 張圖片，自動清空釋放記憶體，避免 24H 掛機閃退
-        if len(self.template_cache) > 50:
-            self.template_cache.clear()
-            print("♻️ [系統] 影像快取已滿，自動釋放記憶體！")
+        """讀取模板灰階圖，附 LRU 快取（支援中文路徑）。"""
+        if full_path in self.template_cache:
+            self.template_cache.move_to_end(full_path)   # 標記為最近使用
+            return self.template_cache[full_path]
 
-        if full_path not in self.template_cache:
-            template_color = cv2.imdecode(np.fromfile(full_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if template_color is None: return None
-            self.template_cache[full_path] = cv2.cvtColor(template_color, cv2.COLOR_BGR2GRAY)
-        return self.template_cache[full_path]
+        try:
+            template_color = cv2.imdecode(
+                np.fromfile(full_path, dtype=np.uint8), cv2.IMREAD_COLOR
+            )
+        except Exception as e:
+            print(f"⚠️ [影像] 讀取失敗: {full_path} ({e})")
+            return None
+
+        if template_color is None:
+            return None
+
+        gray = cv2.cvtColor(template_color, cv2.COLOR_BGR2GRAY)
+        self.template_cache[full_path] = gray
+        if len(self.template_cache) > TEMPLATE_CACHE_SIZE:
+            self.template_cache.popitem(last=False)   # 只踢掉最久沒用的一張
+        return gray
 
     def find_in_folder(self, folder_type, filename, threshold=0.8, click_it=True):
+        """在 assets 資料夾裡找圖。
+
+        ⚠️ click_it 預設為 True（沿用舊行為），只是「檢查」時務必明確寫 click_it=False。
+        """
+        if not filename:
+            return False
         base_dir = self.sys_path if folder_type == 'system' else self.friend_path
         full_path = os.path.join(base_dir, filename)
-        if not os.path.exists(full_path): return False
+
+        if not os.path.exists(full_path):
+            # 缺圖只警告一次，避免每輪迴圈洗版
+            if full_path not in self._missing_warned:
+                self._missing_warned.add(full_path)
+                print(f"⚠️ [素材] 找不到圖片，此判斷將永遠失敗: {filename}")
+            return False
+
         return self.find_by_abspath(full_path, threshold, click_it)
 
     def find_by_abspath(self, full_path, threshold=0.8, click_it=True):
-        if self.current_screen_gray is None: return None 
+        """回傳中心點座標 (x, y)，找不到回傳 None。"""
+        if self.current_screen_gray is None:
+            return None
         template_gray = self._get_template_gray(full_path)
-        if template_gray is None: return None
+        if template_gray is None:
+            return None
+
+        th, tw = template_gray.shape[:2]
+        sh, sw = self.current_screen_gray.shape[:2]
+        if th > sh or tw > sw:
+            print(f"⚠️ [影像] 模板比畫面還大，已跳過: {os.path.basename(full_path)}")
+            return None
 
         res = cv2.matchTemplate(self.current_screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
 
-        # 🚀 救回我們的 Debug 監控器！(已加入幕間物語與自動編成的所有新圖片)
-        filename = os.path.basename(full_path)
-        if filename in [
-            'ap_recovery_check.png', 'attack.png', 'battle_start.png', 'blue_apple.png', 
-            'bond_ce_close.png', 'bond_screen.png', 'bronze_apple.png', 'close_btn.png', 
-            'close_x.png', 'continue_battle.png', 'decide_btn.png', 'drop_screen.png', 
-            'exp_screen.png', 'friend_request.png', 'gold_apple.png', 'menu_button.png', 
-            'network_retry.png', 'next_btn.png', 'quest_start.png', 'refresh_btn.png', 
-            'refresh_yes.png', 'reject_friend.png', 'silver_apple.png', 'sp_no_star.png', 
-            'sp_use_star.png', 'sp_use_star_disabled.png', 'support_check.png', 
-            'support_update.png', 'team_confirm.png', 'turn_1.png', 'turn_2.png', 'turn_3.png', 
-            'select_target_text.png', 'order_change_btn.png', 'order_change_confirm_btn.png', 
-            'retreat_btn.png', 'retreat_decide_btn.png', 'servant_detail_close_x.png',
-            'mission_start.png', 'inventory_full_close.png', 'back_btn.png', 'fgo_icon.png',
-            'class_all.png', 'class_saber.png', 'class_archer.png', 'class_lancer.png', 
-            'class_rider.png', 'class_caster.png', 'class_assassin.png', 'class_berserker.png', 
-            'class_extra.png', 'class_mix.png',
-            # 👇 以下為新加入的圖片群
-            'auto_form_btn1.png', 'auto_form_btn2.png', 'auto_form_btn3.png',
-            'skip_confirm.png', 'go_to_story_stage.png', 'interlude_active.png', 
-            'go_to_interlude_list.png', 'formation_limit.png', 'mandatory_slot.png', 
-            'select_from_support.png'
-        ]:
-            print(f"🔍 正在掃描 [{filename}] | 目前相似度: {max_val:.3f} (門檻: {threshold})")
-            # 🚀 效能優化：不再無腦狂印！只有找到，或相似度大於 0.7 時才顯示，避免 I/O 阻塞延遲！
-            #if max_val >= threshold:
-            #    print(f"✅ 發現目標 [{filename}] | 相似度: {max_val:.3f} (門檻: {threshold})")
-            #elif max_val >= 0.7:
-            #    print(f"👀 接近中 [{filename}] | 相似度: {max_val:.3f}")
+        if DEBUG:
+            filename = os.path.basename(full_path)
+            if filename in DEBUG_TEMPLATES:
+                print(f"🔍 掃描 [{filename}] 相似度: {max_val:.3f} (門檻: {threshold})")
 
         if max_val >= threshold:
-            h, w = template_gray.shape[:2]
-            tx = max_loc[0] + w // 2
-            ty = max_loc[1] + h // 2
+            cx = max_loc[0] + tw // 2
+            cy = max_loc[1] + th // 2
             if click_it:
-                self.smart_click(tx, ty)
-            return (tx, ty)
-        return None 
+                self.smart_click(cx, cy)
+            return (cx, cy)
+        return None
 
-    # 🚀 救回被 ChatGPT 誤刪的陣列核心！這支不見 3x3 助戰就死定了！
-    def find_all_by_abspath(self, full_path, threshold=0.8):
-        if self.current_screen_gray is None: return [] 
+    def find_all_by_abspath(self, full_path, threshold=0.8, max_results=50):
+        """找出畫面上所有符合的位置（助戰 3x3 陣列會用到）。"""
+        if self.current_screen_gray is None:
+            return []
         template_gray = self._get_template_gray(full_path)
-        if template_gray is None: return []
+        if template_gray is None:
+            return []
+
+        th, tw = template_gray.shape[:2]
+        sh, sw = self.current_screen_gray.shape[:2]
+        if th > sh or tw > sw:
+            return []
 
         res = cv2.matchTemplate(self.current_screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        loc = np.where(res >= threshold)
-        
-        h, w = template_gray.shape[:2]
+        ys, xs = np.where(res >= threshold)
+        if len(xs) == 0:
+            return []
+
+        # 先按分數由高到低排序，再做去重，確保留下的是每一群裡最準的那一點
+        scores = res[ys, xs]
+        order = np.argsort(-scores)[:2000]   # 限制候選數量，避免低門檻時爆量
+
         points = []
-        for pt in zip(*loc[::-1]):
-            tx = pt[0] + w // 2
-            ty = pt[1] + h // 2
-            if not any(abs(tx - px) < 20 and abs(ty - py) < 20 for px, py in points):
-                points.append((tx, ty))
+        for i in order:
+            cx = int(xs[i]) + tw // 2
+            cy = int(ys[i]) + th // 2
+            if any(abs(cx - px) < tw // 2 and abs(cy - py) < th // 2 for px, py in points):
+                continue
+            points.append((cx, cy))
+            if len(points) >= max_results:
+                break
         return points
