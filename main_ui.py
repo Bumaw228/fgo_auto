@@ -317,8 +317,13 @@ class FGOApp:
         
         self.lbl_extreme_sleep = ctk.CTkLabel(mode_f, text="盲等(秒):", font=("Arial", 14))
         self.lbl_extreme_sleep.pack(side=tk.LEFT)
-        self.entry_extreme_sleep = ctk.CTkEntry(mode_f, textvariable=self.extreme_sleep, width=50, font=("Arial", 14))
+        self.entry_extreme_sleep = ctk.CTkSlider(
+            mode_f, from_=0.5, to=6.0, number_of_steps=55,
+            command=lambda v: self.extreme_sleep.set(f"{v:.1f}"), width=200
+        )
+        self.entry_extreme_sleep.set(float(self.extreme_sleep.get() or 2.5))
         self.entry_extreme_sleep.pack(side=tk.LEFT, padx=5)
+        ctk.CTkLabel(mode_f, textvariable=self.extreme_sleep, width=35, font=("Arial", 14, "bold")).pack(side=tk.LEFT)
         self.toggle_extreme_sleep_ui()
 
         ctk.CTkLabel(parent, text="--- ADB 畫面抓取與存檔 ---", text_color="gray", font=("Arial", 14)).pack(pady=(15, 5))

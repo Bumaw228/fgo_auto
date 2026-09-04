@@ -363,11 +363,18 @@ class FGONav:
                 else: self.ctx.click(480, 850); self.ctx.smart_sleep(1.5)
                 continue
             if bot.find_in_folder('system', 'next_btn.png', click_it=True): self.ctx.smart_sleep(0.5); continue
-            if bot.find_in_folder('system', 'close_btn.png', click_it=True): self.ctx.smart_sleep(1.0); continue
             
-            if bot.find_in_folder('system', 'continue_battle.png', click_it=False) or \
-               bot.find_in_folder('system', 'menu_button.png', click_it=False) or \
-               bot.find_in_folder('system', 'go_to_interlude_list.png', click_it=False): break
+            # 🚀 只要看到「連續戰鬥」，就代表已經到結算最後一頁，
+            #    此時畫面上的「關閉」是離開周回用的，絕對不能點！
+            if bot.find_in_folder('system', 'continue_battle.png', click_it=False): 
+                break
+
+            if bot.find_in_folder('system', 'close_btn.png', click_it=True): 
+                self.ctx.smart_sleep(1.0); continue
+            
+            if bot.find_in_folder('system', 'menu_button.png', click_it=False) or \
+               bot.find_in_folder('system', 'go_to_interlude_list.png', click_it=False): 
+                break
                 
             if self.ctx.config.get('interlude_mode', False) and self.ctx.vision.check_skip_button() in ["READY", "DARK"]: break
             if np.std(bot.current_screen_gray) < 5: self.ctx.smart_sleep(0.5); continue 
