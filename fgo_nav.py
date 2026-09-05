@@ -3,10 +3,21 @@ import cv2
 import numpy as np
 import os
 
+from coords import (
+    BACK_BTN, AP_DECIDE_FALLBACK, QUEST_START_FALLBACK, CONTINUE_BATTLE_FALLBACK,
+    REJECT_FRIEND_FALLBACK, INTERLUDE_QUEST, SUPPORT_BLIND_PICK,
+    SKIP_BTN, STORY_OPTIONS, TEAM_DOT_Y, team_dot_x,
+)
+
+# 🚀 找不到指定助戰時，最多刷新幾次就放棄（避免整夜空刷）
+MAX_SUPPORT_REFRESH = 30
+
+
 class FGONav:
     def __init__(self, context):
         self.ctx = context
         self.swipe_count = 0
+        self.refresh_count = 0   # 🚀 本輪已刷新助戰清單的次數
         self.is_startup = True 
         self.class_images = {
             "ALL": "class_all.png", "Saber": "class_saber.png", 
@@ -41,7 +52,7 @@ class FGONav:
                 self.ctx.bot.capture_screen() 
                 if self.ctx.bot.find_in_folder('system', 'decide_btn.png', click_it=True):
                     self.ctx.smart_sleep(2.5); return True
-                self.ctx.click(1280, 830, duration=50)
+                self.ctx.click(*AP_DECIDE_FALLBACK, duration=50)
                 self.ctx.smart_sleep(1.5); self.ctx.bot.capture_screen() 
                 if not self.ctx.bot.find_in_folder('system', 'ap_recovery_check.png', click_it=False): return True
             self.ctx.update_status("狀態：吃蘋果卡住，停止運行", fg="red")
@@ -75,7 +86,7 @@ class FGONav:
             
         elif bot.find_in_folder('system', 'reward_screen.png', click_it=False):
             self.is_startup = False # 看到大廳/獎勵畫面，關閉啟動標記
-            self.ctx.click(65, 65, duration=50); self.ctx.smart_sleep(1.5); return "INIT"
+            self.ctx.click(*BACK_BTN, duration=50); self.ctx.smart_sleep(1.5); return "INIT"
             
         elif bot.find_in_folder('system', 'servant_data_update.png', threshold=0.85, click_it=False) or \
              bot.find_in_folder('system', 'new_interlude_unlocked.png', threshold=0.85, click_it=False):
@@ -87,6 +98,7 @@ class FGONav:
         elif bot.find_in_folder('system', 'support_check.png', click_it=False):
             self.is_startup = False
             self.swipe_count = 0
+            self.refresh_count = 0   # 全新一輪助戰搜尋，計數歸零
             return "SUPPORT"
             
         elif bot.find_in_folder('system', 'quest_start.png', click_it=False) or \
@@ -114,7 +126,7 @@ class FGONav:
             
         else:
             if self.ctx.config.get('interlude_mode', False) and np.std(bot.current_screen_gray) >= 5:
-                self.ctx.click(65, 65, duration=50); self.ctx.smart_sleep(0.5)
+                self.ctx.click(*BACK_BTN, duration=50); self.ctx.smart_sleep(0.5)
             else: self.ctx.smart_sleep(0.5)
             
         return "INIT"
@@ -130,7 +142,7 @@ class FGONav:
             self.story_skip_fails = 0 # 重置
         
         if skip_status == "READY":
-            self.ctx.click(1798, 61, duration=50) 
+            self.ctx.click(*SKIP_BTN, duration=50) 
             skip_success = False
             timeout = time.time() + 2.5
             while time.time() < timeout and self.ctx.running:
@@ -145,7 +157,7 @@ class FGONav:
                 print(f"⚠️ [警告] 點擊了 SKIP 但未出現確認框 (累積失敗 {self.story_skip_fails}/3)")
         elif skip_status == "DARK":
             self.story_skip_fails = 0 # 進入選項模式就歸零
-            points = [(950, 315), (950, 415), (950, 505)] 
+            points = STORY_OPTIONS
             for px, py in points:
                 if not self.ctx.running: break
                 self.ctx.click(px, py, duration=50); self.ctx.smart_sleep(0.2)
@@ -154,7 +166,7 @@ class FGONav:
             self.ctx.bot.capture_screen()
             if not (self.ctx.bot.find_in_folder('system', 'menu_button.png', click_it=False) or \
                     self.ctx.bot.find_in_folder('system', 'go_to_interlude_list.png', click_it=False)):
-                self.ctx.click(65, 65, duration=50)
+                self.ctx.click(*BACK_BTN, duration=50)
             else:
                 return "INIT"
                 
@@ -206,17 +218,40 @@ class FGONav:
                 self.ctx.smart_sleep(1.0); return "IDLE"
             
             self.ctx.update_status("狀態：大廳選擇任務中...")
-            self.ctx.click(1380, 300); self.ctx.smart_sleep(1.5); bot.capture_screen()
+            self.ctx.click(*INTERLUDE_QUEST); self.ctx.smart_sleep(1.5); bot.capture_screen()
             if bot.find_in_folder('system', 'mission_start.png', click_it=True): self.ctx.smart_sleep(2.0)
             return "IDLE"
 
         elif bot.find_in_folder('system', 'decide_btn.png', click_it=False):
             bot.find_in_folder('system', 'decide_btn.png'); self.ctx.smart_sleep(2.0); return "IDLE"
         elif bot.find_in_folder('system', 'support_check.png', click_it=False):
-            self.swipe_count = 0; return "SUPPORT"
+            self.swipe_count = 0; self.refresh_count = 0; return "SUPPORT"
         elif bot.find_in_folder('system', 'attack.png', click_it=False):
             return "BATTLE"
         return "IDLE"
+
+    def _refresh_support_list(self):
+        """刷新助戰清單。達到次數上限會直接停止腳本，避免無限空刷。"""
+        bot = self.ctx.bot
+
+        if self.refresh_count >= MAX_SUPPORT_REFRESH:
+            self.ctx.update_status(
+                f"⛔ 狀態：已刷新 {self.refresh_count} 次仍找不到指定助戰，腳本停止", fg="red")
+            print(f"⛔ [助戰] 刷新 {self.refresh_count} 次都沒找到目標，"
+                  f"請確認助戰圖片是否正確、或該從者是否真的有人持有。")
+            self.ctx.running = False
+            return False
+
+        if bot.find_in_folder('system', 'refresh_btn.png', click_it=True):
+            self.ctx.smart_sleep(1.0)
+            bot.capture_screen()
+            if bot.find_in_folder('system', 'refresh_yes.png', click_it=True):
+                self.refresh_count += 1
+                self.swipe_count = 0
+                self.ctx.update_status(
+                    f"狀態：刷新助戰清單 ({self.refresh_count}/{MAX_SUPPORT_REFRESH})")
+                self.ctx.smart_sleep(2.5)
+        return True
 
     def handle_support_state(self):
         bot = self.ctx.bot
@@ -242,7 +277,7 @@ class FGONav:
         ce_paths = [p for p in self.ctx.config.get('target_ce_paths', []) if p]
         
         if self.ctx.config.get('interlude_mode', False) and not servant_paths and not ce_paths:
-            self.ctx.click(600, 350); found = True
+            self.ctx.click(*SUPPORT_BLIND_PICK); found = True
         else:
             serv_list, ce_list = [], []
             for p in servant_paths: serv_list.extend(bot.find_all_by_abspath(p))
@@ -260,7 +295,8 @@ class FGONav:
                 self.ctx.click(ce_list[0][0], ce_list[0][1]); found = True
 
         if found: 
-            self.swipe_count = 0; self.ctx.smart_sleep(3); return "TEAM_SELECT"
+            self.swipe_count = 0; self.refresh_count = 0
+            self.ctx.smart_sleep(3); return "TEAM_SELECT"
         else:
             if np.std(bot.current_screen_gray) < 5: self.ctx.smart_sleep(0.5); return "SUPPORT"
             old_patch = bot.current_screen_gray[400:600, 200:900].copy()
@@ -269,18 +305,14 @@ class FGONav:
             res = cv2.matchTemplate(new_search_area, old_patch, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(res)
             
-            if max_val > 0.95: 
-                if bot.find_in_folder('system', 'refresh_btn.png', click_it=True):
-                    self.ctx.smart_sleep(1.0); bot.capture_screen()
-                    if bot.find_in_folder('system', 'refresh_yes.png', click_it=True):
-                        self.swipe_count = 0; self.ctx.smart_sleep(2.5)
+            if max_val > 0.95:
+                # 畫面沒動 = 已經滑到清單底部，直接刷新
+                self._refresh_support_list()
             else:
                 self.swipe_count += 1
                 if self.swipe_count > 25:
-                    if bot.find_in_folder('system', 'refresh_btn.png', click_it=True):
-                        self.ctx.smart_sleep(1.0); bot.capture_screen()
-                        if bot.find_in_folder('system', 'refresh_yes.png', click_it=True):
-                            self.swipe_count = 0; self.ctx.smart_sleep(2.5)
+                    # 滑太多次還沒找到，也刷新一次換一批人
+                    self._refresh_support_list()
         return "SUPPORT"
 
     def handle_team_select_state(self):
@@ -300,16 +332,10 @@ class FGONav:
             dummy_team = 2 if target_team == 1 else 1
             self.ctx.update_status(f"狀態：選擇隊伍中 (第 {target_team} 隊)...")
             
-            first_dot_x = 697  
-            last_dot_x = 1222  
-            team_dot_y = 75    
-            team_dot_gap = (last_dot_x - first_dot_x) / 14.0
-            
-            dummy_x = int(first_dot_x + (dummy_team - 1) * team_dot_gap)
-            self.ctx.click(dummy_x, team_dot_y); self.ctx.smart_sleep(0.8)
-            
-            target_x = int(first_dot_x + (target_team - 1) * team_dot_gap)
-            self.ctx.click(target_x, team_dot_y); self.ctx.smart_sleep(1.5); bot.capture_screen()
+            # 先點一個不同的隊伍再點回目標隊伍，確保畫面確實重新載入編成
+            self.ctx.click(team_dot_x(dummy_team), TEAM_DOT_Y); self.ctx.smart_sleep(0.8)
+            self.ctx.click(team_dot_x(target_team), TEAM_DOT_Y); self.ctx.smart_sleep(1.5)
+            bot.capture_screen()
 
             if self.ctx.config.get('auto_formation', False) or self.ctx.config.get('interlude_mode', False):
                 for img_name in ['auto_form_btn1.png', 'auto_form_btn2.png']:
@@ -326,7 +352,7 @@ class FGONav:
                         while time.time() < timeout_support and self.ctx.running:
                             self.ctx.smart_sleep(0.5); bot.capture_screen()
                             if bot.find_in_folder('system', 'select_from_support.png', click_it=True):
-                                self.ctx.smart_sleep(2.5); self.ctx.click(600, 350); self.ctx.smart_sleep(3.0); break
+                                self.ctx.smart_sleep(2.5); self.ctx.click(*SUPPORT_BLIND_PICK); self.ctx.smart_sleep(3.0); break
                     else: break 
                 bot.capture_screen()
                 if bot.find_in_folder('system', 'auto_form_btn3.png', click_it=True): self.ctx.smart_sleep(2.0)
@@ -339,7 +365,7 @@ class FGONav:
             if pos_quest: self.ctx.click(pos_quest[0], pos_quest[1] + 10, duration=50)
             elif pos_battle: self.ctx.click(pos_battle[0], pos_battle[1] + 10, duration=50)
             elif pos_mission: self.ctx.click(pos_mission[0], pos_mission[1] + 10, duration=50)
-            else: self.ctx.click(1750, 1000, duration=50)
+            else: self.ctx.click(*QUEST_START_FALLBACK, duration=50)
                 
             self.ctx.update_status(f"狀態：第 {target_team} 隊出擊！任務開始...")
             self.ctx.combat.current_wave = 0; self.ctx.smart_sleep(5); return "INIT"
@@ -353,14 +379,14 @@ class FGONav:
             bot.capture_screen() 
             if bot.find_in_folder('system', 'bond_ce_close.png', click_it=True): self.ctx.smart_sleep(1.0); continue
             if bot.find_in_folder('system', 'reward_screen.png', threshold=0.85, click_it=False):
-                self.ctx.click(65, 65, duration=50); self.ctx.smart_sleep(2.0); return "INIT"
+                self.ctx.click(*BACK_BTN, duration=50); self.ctx.smart_sleep(2.0); return "INIT"
             if bot.find_in_folder('system', 'servant_data_update.png', threshold=0.85, click_it=False) or \
                bot.find_in_folder('system', 'new_interlude_unlocked.png', threshold=0.85, click_it=False):
                 if bot.find_in_folder('system', 'close_btn.png', click_it=True): self.ctx.smart_sleep(2.0); return "INIT"
                 else: self.ctx.smart_sleep(0.5); continue 
             if bot.find_in_folder('system', 'friend_request.png', click_it=False):
                 if bot.find_in_folder('system', 'reject_friend.png'): self.ctx.smart_sleep(1.5)
-                else: self.ctx.click(480, 850); self.ctx.smart_sleep(1.5)
+                else: self.ctx.click(*REJECT_FRIEND_FALLBACK); self.ctx.smart_sleep(1.5)
                 continue
             if bot.find_in_folder('system', 'next_btn.png', click_it=True): self.ctx.smart_sleep(0.5); continue
             
@@ -383,7 +409,7 @@ class FGONav:
             if bot.find_in_folder('system', 'go_to_interlude_list.png', click_it=False) or \
                bot.find_in_folder('system', 'menu_button.png', click_it=False):
                 break   # 🚀 改用 break，讓下方的周回計數能正常執行
-            self.ctx.click(65, 65, times=1, duration=50); self.ctx.smart_sleep(0.2)
+            self.ctx.click(*BACK_BTN, times=1, duration=50); self.ctx.smart_sleep(0.2)
 
         if self.ctx.config.get('interlude_mode', False):
             self.ctx.smart_sleep(1.0); return "INIT"
@@ -393,7 +419,7 @@ class FGONav:
             self.ctx.update_status(f"🎉 任務達成：已完成 {self.ctx.current_loop} 場周回！", fg="green")
             bot.capture_screen()
             if bot.find_in_folder('system', 'continue_battle.png', click_it=False):
-                if not bot.find_in_folder('system', 'close_btn.png'): self.ctx.click(650, 850) 
+                if not bot.find_in_folder('system', 'close_btn.png'): self.ctx.click(*CONTINUE_BATTLE_FALLBACK)
                 self.ctx.smart_sleep(3.0) 
             self.ctx.running = False; return "RESULT"
         else:

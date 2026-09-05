@@ -3,6 +3,7 @@ from fgo_core import FGOBot
 from fgo_vision import FGOVision
 from fgo_combat import FGOCombat
 from fgo_nav import FGONav
+from coords import SERVANT_PORTRAIT
 
 # 🚀 專屬中斷例外，用來達成 0.1 秒瞬間停止腳本
 class ScriptStoppedException(Exception):
@@ -105,7 +106,7 @@ class FGOLogic:
                         print("🚀 [啟動防護] 偵測到從戰鬥中啟動腳本！強制執行 UI 洗白 (無視 Attack 判斷)...")
                         
                         # 暴力洗白：長按角色開啟詳情，然後關閉 (這能強制覆蓋並關掉御主技能)
-                        self.click(705, 670, times=3, duration=50) 
+                        self.click(*SERVANT_PORTRAIT, times=3, duration=50) 
                         self.smart_sleep(1.5) 
                         
                         timeout = time.time() + 3.0

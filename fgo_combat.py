@@ -2,7 +2,14 @@ import time
 import random
 import cv2
 import numpy as np
-import re  
+import re
+
+from coords import (
+    SKILLS, MASTER_SKILLS, MASTER_BTN, TARGETS, ENEMIES, NP_CARDS,
+    CARDS, ATTACK_BTN, BLANK_SPOT, SERVANT_PORTRAIT,
+    ORDER_FRONT, ORDER_BACK, ORDER_CONFIRM_BTN, ORDER_CHANGE_SKILL,
+    AI_TARGET_POSITIONS,
+)
 
 class FGOCombat:
     def __init__(self, context):
@@ -24,7 +31,7 @@ class FGOCombat:
             self.ctx.smart_sleep(1.0)
             return
 
-        self.ctx.click(705, 670, times=3, duration=50) 
+        self.ctx.click(*SERVANT_PORTRAIT, times=3, duration=50) 
         self.ctx.smart_sleep(1.5) 
         
         timeout = time.time() + 3.0
@@ -55,7 +62,7 @@ class FGOCombat:
         animation_started = False
         timeout_start = time.time() + 1.5 # 最多等 1.5 秒讓 UI 消失
         while time.time() < timeout_start and self.ctx.running:
-            if do_click: self.ctx.click(1750, 150, duration=50) 
+            if do_click: self.ctx.click(*BLANK_SPOT, duration=50) 
             self.ctx.bot.capture_screen()
             if not self.ctx.bot.find_in_folder('system', 'attack.png', click_it=False):
                 animation_started = True
@@ -67,7 +74,7 @@ class FGOCombat:
         if animation_started:
             timeout_end = time.time() + timeout_sec
             while time.time() < timeout_end and self.ctx.running:
-                if do_click: self.ctx.click(1750, 150, duration=50) 
+                if do_click: self.ctx.click(*BLANK_SPOT, duration=50) 
                 self.ctx.bot.capture_screen()
                 if self.ctx.bot.find_in_folder('system', 'attack.png', click_it=False):
                     break
@@ -92,8 +99,8 @@ class FGOCombat:
 
             if is_cd:
                 print(f"⏩ 偵測到{role_str}技能處於 CD 狀態，自動跳過！")
-                if is_master_skill: self.ctx.click(1792, 472); self.ctx.smart_sleep(0.4) 
-                else: self.ctx.click(1750, 150, times=2, duration=50)
+                if is_master_skill: self.ctx.click(*MASTER_BTN); self.ctx.smart_sleep(0.4) 
+                else: self.ctx.click(*BLANK_SPOT, times=2, duration=50)
                 return
 
         max_retries = 2 if skill_mode != "極限盲操" else 1
@@ -129,7 +136,7 @@ class FGOCombat:
                     if skill_mode == "極限盲操":
                         end_time = time.time() + extreme_sleep
                         while time.time() < end_time and self.ctx.running: 
-                            self.ctx.click(1750, 150, duration=50) 
+                            self.ctx.click(*BLANK_SPOT, duration=50) 
                             self.ctx.smart_sleep(0.15) 
                         return 
 
@@ -141,7 +148,7 @@ class FGOCombat:
                 if skill_mode == "極限盲操":
                     end_time = time.time() + extreme_sleep
                     while time.time() < end_time and self.ctx.running: 
-                        self.ctx.click(1750, 150, duration=50) 
+                        self.ctx.click(*BLANK_SPOT, duration=50) 
                         self.ctx.smart_sleep(0.15) 
                     return 
 
@@ -151,8 +158,8 @@ class FGOCombat:
             self.ctx.smart_sleep(0.5)
 
         if skill_mode != "極限盲操":
-            if is_master_skill: self.ctx.click(1792, 472); self.ctx.smart_sleep(0.6) 
-            else: self.ctx.click(1750, 150, times=2, duration=50)
+            if is_master_skill: self.ctx.click(*MASTER_BTN); self.ctx.smart_sleep(0.6) 
+            else: self.ctx.click(*BLANK_SPOT, times=2, duration=50)
             self.wait_attack_and_skip(do_click=True)
 
     def select_battle_cards(self, current_wave=99):
@@ -164,9 +171,9 @@ class FGOCombat:
 
         if not is_ai_mode:
             if is_auto_np and can_auto_np:
-                for nx, ny in [(605, 300), (960, 300), (1315, 300)]:
+                for nx, ny in NP_CARDS[1:]:
                     self.ctx.click(nx, ny); self.ctx.smart_sleep(0.15)
-            cards = [(195, 755), (580, 755), (960, 755), (1345, 755), (1735, 755)]
+            cards = list(CARDS)
             random.shuffle(cards)
             for i in range(3): self.ctx.click(cards[i][0], cards[i][1]); self.ctx.smart_sleep(0.25)
             self.ctx.smart_sleep(0.2); self.ctx.click(cards[3][0], cards[3][1]) 
@@ -174,7 +181,7 @@ class FGOCombat:
 
         print(f"🧠 [AI 決策] 啟動智能選卡！(戰略: {priority_str})")
         if is_auto_np and can_auto_np:
-            np_cards = [(605, 300), (960, 300), (1315, 300)]
+            np_cards = NP_CARDS[1:]
             self.ctx.bot.capture_screen()
             img = self.ctx.bot.current_screen
             for i, (nx, ny) in enumerate(np_cards):
@@ -185,7 +192,7 @@ class FGOCombat:
                         self.ctx.click(nx, ny); self.ctx.smart_sleep(0.15)
             
         color_order = [] if priority_str == "無" else [c.strip() for c in priority_str.split('>')]
-        cards = [(195, 755), (580, 755), (960, 755), (1345, 755), (1735, 755)]
+        cards = list(CARDS)
         card_scores = []
         self.ctx.bot.capture_screen()
         screen_color = self.ctx.bot.current_screen
@@ -224,15 +231,16 @@ class FGOCombat:
         if not cmds: return False 
         skill_mode = self.ctx.config.get('skill_mode', '智慧安全')
         
-        enemies = [None, (65, 65), (440, 65), (815, 65)]
-        skills = [None, (111, 871), (244, 871), (376, 871), (586, 871), (716, 871), (847, 871), (1060, 871), (1191, 871), (1324, 871)]
-        targets = [None, (485, 590), (965, 590), (1425, 590)]
-        nps = [None, (605, 300), (960, 300), (1315, 300)]
-        master_btn = (1792, 472) 
-        m_skills = [None, (1360, 468), (1493, 468), (1626, 468)]
-        o_front = [None, (205, 520), (500, 520), (805, 520)]
-        o_back = [None, (1095, 520), (1400, 520), (1695, 520)]
-        order_change_confirm_btn = (963, 940) 
+        # 🚀 座標統一由 coords.py 管理，改版時只需修改該檔案
+        enemies = ENEMIES
+        skills = SKILLS
+        targets = TARGETS
+        nps = NP_CARDS
+        master_btn = MASTER_BTN
+        m_skills = MASTER_SKILLS
+        o_front = ORDER_FRONT
+        o_back = ORDER_BACK
+        order_change_confirm_btn = ORDER_CONFIRM_BTN
         
         attack_opened = False 
 
@@ -251,7 +259,7 @@ class FGOCombat:
                 if match:
                     if not attack_opened:
                         if skill_mode == "極限盲操": self.wait_attack_and_skip(timeout_sec=8.0, do_click=False); self.ctx.smart_sleep(0.2)
-                        self.ctx.smart_sleep(0.1); self.ctx.click(1650, 920)
+                        self.ctx.smart_sleep(0.1); self.ctx.click(*ATTACK_BTN)
                         self.ctx.smart_sleep(1.0)
                         attack_opened = True
                     idx = int(match.group(1))
@@ -284,15 +292,15 @@ class FGOCombat:
 
                     is_order_change_cd = False
                     self.ctx.bot.capture_screen() 
-                    s_before, v_before = self.ctx.vision.get_skill_color_stats(m_skills[3][0], m_skills[3][1])
+                    s_before, v_before = self.ctx.vision.get_skill_color_stats(*ORDER_CHANGE_SKILL)
                     if skill_mode == "智慧安全":
-                        if self.ctx.vision.check_skill_cooldown_visual(m_skills[3][0], m_skills[3][1], is_master=True): is_order_change_cd = True
+                        if self.ctx.vision.check_skill_cooldown_visual(*ORDER_CHANGE_SKILL, is_master=True): is_order_change_cd = True
                         elif v_before < 60: is_order_change_cd = True
 
                     if is_order_change_cd:
-                        self.ctx.click(1792, 472); self.ctx.smart_sleep(0.6); continue 
+                        self.ctx.click(*MASTER_BTN); self.ctx.smart_sleep(0.6); continue 
 
-                    self.ctx.click(m_skills[3][0], m_skills[3][1])
+                    self.ctx.click(*ORDER_CHANGE_SKILL)
                     self.ctx.smart_sleep(1.2)
                     
                     f, b = int(match.group(1)), int(match.group(2))
@@ -314,7 +322,7 @@ class FGOCombat:
         self.ctx.update_status("狀態：等待攻擊結束 (加速跳過中...)")
         timeout = time.time() + 150.0 
         while time.time() < timeout and self.ctx.running:
-            self.ctx.click(1750, 150, duration=50)
+            self.ctx.click(*BLANK_SPOT, duration=50)
             self.ctx.smart_sleep(0.2) 
             self.ctx.bot.capture_screen()
             
@@ -347,7 +355,7 @@ class FGOCombat:
                 self.ctx.bot.capture_screen() 
                 available_skills = self.ctx.vision.check_skill_available_batch(is_master=False)
                 skills_to_use = [i for i, avail in enumerate(available_skills) if avail][:3]
-                skill_coords = [None, (111, 871), (244, 871), (376, 871), (586, 871), (716, 871), (847, 871), (1060, 871), (1191, 871), (1324, 871)]
+                skill_coords = SKILLS
                 
                 for s_idx in skills_to_use:
                     if not self.ctx.running: break
@@ -364,7 +372,7 @@ class FGOCombat:
                         self.ctx.smart_sleep(0.5); bot.capture_screen()
                     
                     if bot.find_in_folder('system', 'select_target_text.png', click_it=False):
-                        all_target_positions = [(485, 590), (725, 590), (965, 590), (1195, 590), (1425, 590)]
+                        all_target_positions = AI_TARGET_POSITIONS
                         try_order = all_target_positions.copy()
                         if is_random_mode: random.shuffle(try_order)
                             
@@ -382,9 +390,9 @@ class FGOCombat:
                 if self.ctx.config.get('skill_mode') == '極限盲操': self.wait_attack_and_skip(timeout_sec=8.0, do_click=False)
                 bot.capture_screen() 
                 if bot.find_in_folder('system', 'attack.png', click_it=False):
-                    self.ctx.click(1650, 920); self.ctx.smart_sleep(2.5); bot.capture_screen()
+                    self.ctx.click(*ATTACK_BTN); self.ctx.smart_sleep(2.5); bot.capture_screen()
                     if bot.find_in_folder('system', 'attack.png', click_it=False):
-                        self.ctx.click(1650, 920); self.ctx.smart_sleep(2.5) 
+                        self.ctx.click(*ATTACK_BTN); self.ctx.smart_sleep(2.5) 
                 
             self.ctx.update_status("狀態：戰鬥中 - 選擇指令卡...")
             self.select_battle_cards(self.current_wave)
@@ -400,7 +408,7 @@ class FGOCombat:
 
             if not attack_started:
                 bot.find_in_folder('system', 'back_btn.png', click_it=True)
-                self.ctx.smart_sleep(1.5); self.ctx.click(1650, 920); self.ctx.smart_sleep(2.5)
+                self.ctx.smart_sleep(1.5); self.ctx.click(*ATTACK_BTN); self.ctx.smart_sleep(2.5)
                 self.select_battle_cards(self.current_wave); self.ctx.smart_sleep(1.0)
 
             self.ctx.smart_sleep(8)

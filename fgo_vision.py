@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import os
 
+from coords import SKILLS, MASTER_SKILLS, ROI_SKIP_BTN, CD_ROI_OFFSET_X, CD_ROI_OFFSET_Y
+
 class FGOVision:
     def __init__(self, context):
         self.ctx = context  # 取得 FGOLogic 的參考
@@ -49,7 +51,8 @@ class FGOVision:
         
         screen_gray = self.ctx.bot.current_screen_gray
         h, w = screen_gray.shape
-        roi = screen_gray[0:150, 1500:w]
+        sx1, sy1, sx2, sy2 = ROI_SKIP_BTN
+        roi = screen_gray[sy1:sy2, sx1:min(sx2, w)]
         
         if roi.shape[0] < self.skip_tpl.shape[0] or roi.shape[1] < self.skip_tpl.shape[1]:
             return "NONE"
@@ -64,7 +67,7 @@ class FGOVision:
         if np.isnan(max_val) or max_val < 0.70: 
             return "NONE"
             
-        real_x = 1500 + max_loc[0]
+        real_x = sx1 + max_loc[0]
         real_y = max_loc[1]
         th, tw = self.skip_tpl.shape
         
@@ -105,8 +108,8 @@ class FGOVision:
         screen_gray = self.ctx.bot.current_screen_gray
         h, w = screen_gray.shape
         
-        roi_startY, roi_endY = max(0, y), min(h, y + 60)
-        roi_startX, roi_endX = max(0, x - 55), min(w, x + 55)
+        roi_startY, roi_endY = max(0, y), min(h, y + CD_ROI_OFFSET_Y)
+        roi_startX, roi_endX = max(0, x - CD_ROI_OFFSET_X), min(w, x + CD_ROI_OFFSET_X)
         roi = screen_gray[roi_startY:roi_endY, roi_startX:roi_endX]
         
         if roi.shape[0] < tpl.shape[0] or roi.shape[1] < tpl.shape[1]: return False
@@ -119,14 +122,14 @@ class FGOVision:
         return max_val >= 0.75
 
     def check_skill_available_batch(self, is_master=False):
-        if self.ctx.bot.current_screen_gray is None: return [False] * (3 if is_master else 9)
+        if self.ctx.bot.current_screen_gray is None:
+            return [False] * (len(MASTER_SKILLS) - 1 if is_master else len(SKILLS) - 1)
         
         screen_gray = self.ctx.bot.current_screen_gray
         h, w = screen_gray.shape
         
-        skill_coords = [(1360, 468), (1493, 468), (1626, 468)] if is_master else [
-            (111, 871), (244, 871), (376, 871), (586, 871), (716, 871), (847, 871), (1060, 871), (1191, 871), (1324, 871)
-        ]
+        # 🚀 統一由 coords.py 提供。切掉索引 0 的 None，讓這裡維持從 0 開始的清單
+        skill_coords = MASTER_SKILLS[1:] if is_master else SKILLS[1:]
 
         available_list = []
         tpl = self.master_cooldown_tpl if is_master else self.cooldown_tpl
@@ -140,8 +143,8 @@ class FGOVision:
                     available_list.append(False)
                     continue
             
-            roi_startY, roi_endY = max(0, y), min(h, y + 60)
-            roi_startX, roi_endX = max(0, x - 55), min(w, x + 55)
+            roi_startY, roi_endY = max(0, y), min(h, y + CD_ROI_OFFSET_Y)
+            roi_startX, roi_endX = max(0, x - CD_ROI_OFFSET_X), min(w, x + CD_ROI_OFFSET_X)
             roi = screen_gray[roi_startY:roi_endY, roi_startX:roi_endX]
             
             if tpl is not None and roi.shape[0] >= tpl.shape[0] and roi.shape[1] >= tpl.shape[1]:

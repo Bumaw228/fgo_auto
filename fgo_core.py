@@ -15,7 +15,7 @@ import numpy as np
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 
 # 🐞 除錯開關：正式發布時改成 False，可大幅減少主控台 I/O、加快主迴圈
-DEBUG = True
+DEBUG = False
 
 # 只有列在這裡的圖片，在 DEBUG 模式下才會印出相似度
 DEBUG_TEMPLATES = {
@@ -83,7 +83,9 @@ COMMON_ADB_PORTS = [
     "127.0.0.1:16384",   # MuMu 12
     "127.0.0.1:62001",   # 夜神 Nox
     "127.0.0.1:21503",   # 逍遙 Memu
-    "127.0.0.1:5037",
+    "127.0.0.1:16416",   # MuMu 12 多開第 2 台
+    "127.0.0.1:16448",   # MuMu 12 多開第 3 台
+    "127.0.0.1:62025",   # 夜神多開第 2 台
 ]
 
 
@@ -92,6 +94,9 @@ def _run_adb(args, timeout=15):
     try:
         return subprocess.run(
             [ADB_EXE] + args, capture_output=True, text=True,
+            # 🚀 必須指定 utf-8：繁中 Windows 預設用 cp950 解碼，
+            #    遇到 adb 回傳的中文或特殊字元會拋 UnicodeDecodeError
+            encoding='utf-8', errors='ignore',
             timeout=timeout, creationflags=CREATE_NO_WINDOW
         )
     except Exception as e:
@@ -129,7 +134,8 @@ def detect_devices(status_cb=None):
     # 有些模擬器不會自動註冊，必須主動 connect 才看得到
     report("嘗試連線常見模擬器連接埠...")
     for port in COMMON_ADB_PORTS:
-        _run_adb(["connect", port], timeout=8)
+        # 連得上的埠通常 1 秒內就回應，逾時設短一點避免累積等待
+        _run_adb(["connect", port], timeout=4)
     devices = list_devices()
     if devices:
         return devices
@@ -139,7 +145,7 @@ def detect_devices(status_cb=None):
     _run_adb(["kill-server"], timeout=10)
     _run_adb(["start-server"], timeout=20)
     for port in COMMON_ADB_PORTS:
-        _run_adb(["connect", port], timeout=8)
+        _run_adb(["connect", port], timeout=4)
     return _verify(list_devices())
 
 def _verify(devices):
