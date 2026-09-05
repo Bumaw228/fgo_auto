@@ -27,11 +27,19 @@ GITHUB_OWNER = "Bumaw228"
 GITHUB_REPO = "fgo_auto"
 
 # 🚀 每次發版都要改這裡，並讓 GitHub 上的 tag 一致（tag 打 v1.0.1，這裡寫 1.0.1）
-CURRENT_VERSION = "0.9.1"
+CURRENT_VERSION = "0.9.0"
 
 API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 CREATE_NEW_CONSOLE = 0x00000010
+
+# ==========================================
+# 🛡️ 更新時要保護的使用者資料
+# ==========================================
+# 這些目錄／檔案屬於使用者自己的東西，更新時一律不覆蓋。
+# 新使用者直接下載 zip 時仍會拿到完整內容，只有「就地更新」才會跳過。
+PROTECTED_DIRS = ["assets_saves", "assets_friends"]
+PROTECTED_FILES = ["config.json"]
 
 
 def get_base_dir():
@@ -180,7 +188,8 @@ if not errorlevel 1 (
 )
 
 echo   正在複製新版檔案...
-robocopy "{src}" "{dst}" /E /IS /NFL /NDL /NJH /NJS /R:3 /W:2
+echo   (使用者的存檔與助戰圖片將保留不動)
+robocopy "{src}" "{dst}" /E /IS {excludes} /NFL /NDL /NJH /NJS /R:3 /W:2
 if errorlevel 8 (
     echo.
     echo   [失敗] 檔案複製發生錯誤，可能是權限不足。
@@ -227,11 +236,19 @@ def apply_update(zip_path, on_error=None):
                 on_error(f"更新包內找不到 {exe_name}，已取消更新")
             return False
 
+        # /XD 排除目錄、/XF 排除檔案，讓使用者資料完全不被更新碰到
+        excludes = ""
+        if PROTECTED_DIRS:
+            excludes += " /XD " + " ".join(f'"{d}"' for d in PROTECTED_DIRS)
+        if PROTECTED_FILES:
+            excludes += " /XF " + " ".join(f'"{f}"' for f in PROTECTED_FILES)
+
         bat_path = os.path.join(tempfile.gettempdir(), "fgo_apply_update.bat")
         with open(bat_path, "w", encoding="utf-8") as f:
             f.write(_UPDATE_BAT.format(
                 repo=GITHUB_REPO, exe=exe_name,
                 src=src_dir, dst=install_dir, tmp=tmp_dir,
+                excludes=excludes.strip(),
             ))
 
         # 開新視窗執行，讓使用者看得到進度；主程式接著自己關閉
