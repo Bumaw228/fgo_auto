@@ -64,10 +64,11 @@ class FGONav:
         bot = self.ctx.bot
         self.ctx.update_status("狀態：全局掃描，判斷當前畫面...")
         
-        skip_status = self.ctx.vision.check_skip_button()
-        if self.ctx.config.get('interlude_mode', False) and skip_status in ["READY", "DARK"]:
-            self.is_startup = False # 進入劇情，關閉啟動標記
-            return "STORY"
+        # 🚀 先判斷模式再做影像運算：非幕間模式時，這個結果本來就會被丟掉
+        if self.ctx.config.get('interlude_mode', False):
+            if self.ctx.vision.check_skip_button() in ["READY", "DARK"]:
+                self.is_startup = False # 進入劇情，關閉啟動標記
+                return "STORY"
             
         if bot.find_in_folder('system', 'attack.png', click_it=False) or \
            bot.find_in_folder('system', 'select_target_text.png', click_it=False) or \

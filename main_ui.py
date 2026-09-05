@@ -79,7 +79,9 @@ class FGOApp:
         # 🌟 初始化變數
         # ==========================================
         self.running = False
-        self.logic_thread = None 
+        self.logic_thread = None
+        # 🚀 每次啟動遞增，用來辨識「這是第幾輪」，避免舊執行緒的收尾關掉新一輪的 UI
+        self.session_id = 0 
         self.dot_count = 0 
         self.last_raw_image = None 
         self.entry_extreme_sleep = None 
@@ -100,6 +102,7 @@ class FGOApp:
         self.auto_formation = tk.BooleanVar(value=False)
         self.interlude_mode = tk.BooleanVar(value=False)
         self.smart_turn_mode = tk.BooleanVar(value=False)
+        self.use_roi = tk.BooleanVar(value=True)
 
         self.script_data = [[], [], []] 
         self.target_servant_paths = [None, None, None]
@@ -339,6 +342,7 @@ class FGOApp:
         ctk.CTkCheckBox(switch_frame, text="幕間劇情模式 (註：主線複雜選項尚未完全支援)", variable=self.interlude_mode, font=("Arial", 14)).pack(pady=10, anchor="w")
         ctk.CTkCheckBox(switch_frame, text="自動編隊 (每次出擊強制點「自動編成」刷絆用)", variable=self.auto_formation, font=("Arial", 14)).pack(pady=10, anchor="w")
         ctk.CTkCheckBox(switch_frame, text="智能對齊 Wave (讀取右上角 1/3, 2/3)", variable=self.smart_turn_mode, font=("Arial", 14)).pack(pady=10, anchor="w")
+        ctk.CTkCheckBox(switch_frame, text="ROI 加速 (限定搜尋範圍，大幅提升判斷速度)", variable=self.use_roi, font=("Arial", 14)).pack(pady=10, anchor="w")
 
         mode_f = ctk.CTkFrame(switch_frame, fg_color="transparent"); mode_f.pack(pady=5, anchor="w")
         ctk.CTkLabel(mode_f, text="技能施放模式:", font=("Arial", 14)).pack(side=tk.LEFT)
@@ -478,7 +482,8 @@ class FGOApp:
             'target_ce_paths': self.target_ce_paths, 'team_index': int(self.team_index.get()),
             'script_data': self.script_data, 'auto_formation': self.auto_formation.get(),
             'interlude_mode': self.interlude_mode.get(), 'ai_card_mode': self.ai_card_mode.get(),
-            'card_priority': self.card_priority.get(), 'auto_np_mode': self.auto_np_mode.get()
+            'card_priority': self.card_priority.get(), 'auto_np_mode': self.auto_np_mode.get(),
+            'use_roi': self.use_roi.get()
         }
 
     def _apply_profile_data(self, data):
@@ -518,6 +523,7 @@ class FGOApp:
         self.ai_card_mode.set(data.get('ai_card_mode', False))
         self.card_priority.set(data.get('card_priority', "無"))
         self.auto_np_mode.set(data.get('auto_np_mode', True))
+        self.use_roi.set(data.get('use_roi', True))
         self.script_data = data.get('script_data', [[], [], []])
         self.update_script_display()
 
@@ -609,16 +615,30 @@ class FGOApp:
                     'target_servant_paths': self.target_servant_paths, 'target_ce_paths': self.target_ce_paths,
                     'ai_card_mode': self.ai_card_mode.get(), 'card_priority': self.card_priority.get(),
                     'auto_np_mode': self.auto_np_mode.get(), 'auto_formation': self.auto_formation.get(),
-                    'interlude_mode': self.interlude_mode.get()
+                    'interlude_mode': self.interlude_mode.get(),
+                    'use_roi': self.use_roi.get()
                 }
                 
-                self.logic_thread = FGOLogic(config, self.update_status_label, self.stop_script)
-                #self.logic_thread.bot.init_device()
-                
+                self.session_id += 1
+                my_session = self.session_id
+                self.logic_thread = None
+                self.update_status_label("狀態：正在連線模擬器...", "orange")
+
                 # 獨立執行緒執行大腦，若出錯也能被抓到
                 def thread_worker():
                     try:
-                        self.logic_thread.run_logic()
+                        # 🚀 FGOLogic 建構時會跑 ADB 初始化（最久 10 秒），
+                        #    放在這裡執行，按下「開始」時視窗就不會凍住
+                        logic = FGOLogic(config, self.update_status_label,
+                                         lambda: self.stop_script(session=my_session))
+
+                        # 建構期間若使用者已按下停止（或又按了一次開始），直接放棄這一輪
+                        if my_session != self.session_id or not self.running:
+                            print("🛑 啟動已被取消，本輪不執行")
+                            return
+
+                        self.logic_thread = logic
+                        logic.run_logic()
                     except Exception as e:
                         err_msg = traceback.format_exc()
                         print(err_msg)
@@ -635,9 +655,15 @@ class FGOApp:
                 self.btn_stop.configure(state="disabled")
                 messagebox.showerror("啟動失敗", traceback.format_exc())
             
-    def stop_script(self): 
+    def stop_script(self, session=None):
+        # 🚀 舊執行緒收尾時會帶著自己的 session 編號回呼，
+        #    如果使用者已經開始新的一輪，就忽略這次請求，避免誤關新一輪的 UI
+        if session is not None and session != self.session_id:
+            print(f"↩️ 忽略第 {session} 輪的停止回呼（目前已是第 {self.session_id} 輪）")
+            return
+
         self.running = False
-        if self.logic_thread: self.logic_thread.running = False 
+        if self.logic_thread: self.logic_thread.running = False
         self.root.after(0, self._stop_script_ui)
 
     def _stop_script_ui(self):

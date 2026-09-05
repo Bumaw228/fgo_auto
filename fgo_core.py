@@ -7,6 +7,8 @@ from collections import OrderedDict
 import cv2
 import numpy as np
 
+from coords import TEMPLATE_ROI, ROI_VERIFY_EVERY
+
 # ==========================================
 # 🔧 全域設定
 # ==========================================
@@ -45,6 +47,10 @@ CANVAS_H = 1080
 
 # 影像快取上限（張數）
 TEMPLATE_CACHE_SIZE = 60
+
+# 🔬 開發用：記錄每張模板實際被找到的位置，寫入 roi_log.csv
+#    收集完資料後請改回 False，否則每次命中都會寫檔
+ROI_RECORD = False
 
 
 def get_base_dir():
@@ -163,8 +169,11 @@ def _verify(devices):
 class FGOBot:
     """負責與模擬器溝通的底層：截圖、點擊、影像比對。"""
 
-    def __init__(self, device_id="127.0.0.1:5555"):
+    def __init__(self, device_id="127.0.0.1:5555", use_roi=True):
         self.device_id = device_id
+        self.use_roi = use_roi              # 是否啟用 ROI 加速
+        self._roi_miss = {}                 # 各模板連續未命中次數
+        self._roi_disabled = set()          # 已確認位置不符、自動停用 ROI 的模板
         self.base_dir = get_base_dir()
         self.sys_path = os.path.join(self.base_dir, "assets_system")
         self.friend_path = os.path.join(self.base_dir, "assets_friends")
@@ -358,6 +367,39 @@ class FGOBot:
 
         return self.find_by_abspath(full_path, threshold, click_it)
 
+    def _match(self, template_gray, region=None):
+        """在指定範圍內做模板比對，回傳 (左上角座標, 相似度)。
+
+        region=None 代表搜尋整個畫面。回傳的座標已換算回全畫面基準。
+        """
+        img = self.current_screen_gray
+        ox = oy = 0
+
+        if region:
+            x1, y1, x2, y2 = region
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+            sub = img[y1:y2, x1:x2]
+            if sub.shape[0] < template_gray.shape[0] or sub.shape[1] < template_gray.shape[1]:
+                return None, -1.0
+            img, ox, oy = sub, x1, y1
+
+        res = cv2.matchTemplate(img, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        return (max_loc[0] + ox, max_loc[1] + oy), max_val
+
+    def _record_roi_hit(self, filename, loc, size, score):
+        """開發用：把命中位置寫入 roi_log.csv，供之後產生 ROI 表"""
+        try:
+            path = os.path.join(self.base_dir, "roi_log.csv")
+            new = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as f:
+                if new:
+                    f.write("filename,x,y,w,h,score\n")
+                f.write(f"{filename},{loc[0]},{loc[1]},{size[1]},{size[0]},{score:.3f}\n")
+        except Exception as e:
+            print(f"⚠️ [ROI] 寫入紀錄失敗: {e}")
+
     def find_by_abspath(self, full_path, threshold=0.8, click_it=True):
         """回傳中心點座標 (x, y)，找不到回傳 None。"""
         if self.current_screen_gray is None:
@@ -372,17 +414,40 @@ class FGOBot:
             print(f"⚠️ [影像] 模板比畫面還大，已跳過: {os.path.basename(full_path)}")
             return None
 
-        res = cv2.matchTemplate(self.current_screen_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        filename = os.path.basename(full_path)
 
-        if DEBUG:
-            filename = os.path.basename(full_path)
-            if filename in DEBUG_TEMPLATES:
-                print(f"🔍 掃描 [{filename}] 相似度: {max_val:.3f} (門檻: {threshold})")
+        region = None
+        if self.use_roi and filename not in self._roi_disabled:
+            region = TEMPLATE_ROI.get(filename)
 
-        if max_val >= threshold:
-            cx = max_loc[0] + tw // 2
-            cy = max_loc[1] + th // 2
+        loc, max_val = self._match(template_gray, region)
+
+        # ROI 內沒找到時，每累積 N 次才做一次全畫面複查。
+        # 這樣既能偵測改版造成的位置變動，又不會讓每次未命中都退回全畫面掃描。
+        if region and max_val < threshold:
+            self._roi_miss[filename] = self._roi_miss.get(filename, 0) + 1
+            if self._roi_miss[filename] >= ROI_VERIFY_EVERY:
+                self._roi_miss[filename] = 0
+                full_loc, full_val = self._match(template_gray, None)
+                if full_val >= threshold:
+                    print(f"⚠️ [ROI] {filename} 不在設定範圍內，卻於全畫面 "
+                          f"({full_loc[0]}, {full_loc[1]}) 找到（相似度 {full_val:.3f}）。")
+                    print(f"   → 遊戲介面位置可能已變動，已自動停用此圖的 ROI 並改用全畫面。")
+                    print(f"   → 請更新 coords.py 的 TEMPLATE_ROI['{filename}']。")
+                    self._roi_disabled.add(filename)
+                    loc, max_val = full_loc, full_val
+        elif region:
+            self._roi_miss[filename] = 0   # 命中就重置計數
+
+        if DEBUG and filename in DEBUG_TEMPLATES:
+            scope = "ROI" if region else "全畫面"
+            print(f"🔍 掃描 [{filename}] 相似度: {max_val:.3f} (門檻: {threshold}, 範圍: {scope})")
+
+        if max_val >= threshold and loc is not None:
+            cx = loc[0] + tw // 2
+            cy = loc[1] + th // 2
+            if ROI_RECORD:
+                self._record_roi_hit(filename, loc, (th, tw), max_val)
             if click_it:
                 self.smart_click(cx, cy)
             return (cx, cy)

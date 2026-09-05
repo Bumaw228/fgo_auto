@@ -12,6 +12,10 @@ assets_saves/*.json
 *.log
 fgo_screenshot.png
 
+# 開發暫存
+roi_log.csv
+debug_*.png
+
 .idea/
 .vscode/
 .DS_Store

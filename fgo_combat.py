@@ -226,6 +226,20 @@ class FGOCombat:
         self.ctx.smart_sleep(0.3)
         self.ctx.click(card_scores[3]['pos'][0], card_scores[3]['pos'][1])
 
+    @staticmethod
+    def _safe_pos(table, idx, label, cmd):
+        """安全地從座標表取值。
+
+        指令來自 JSON 設定檔，使用者可能手動編輯而寫出超出範圍的編號
+        （例如 E0、S12）。這裡統一擋下來，印出提示並略過該指令，
+        避免整個腳本因為一個手誤而崩潰。
+        """
+        if not isinstance(idx, int) or idx < 1 or idx >= len(table) or table[idx] is None:
+            print(f"⚠️ [腳本] 指令 '{cmd}' 的{label}編號 {idx} 超出範圍 "
+                  f"(可用 1~{len(table) - 1})，已略過這道指令。")
+            return None
+        return table[idx]
+
     def execute_script_from_list(self, wave_idx):
         cmds = self.ctx.config['script_data'][wave_idx]
         if not cmds: return False 
@@ -251,7 +265,9 @@ class FGOCombat:
                 match = re.match(r'E(\d+)', c)
                 if match:
                     idx = int(match.group(1))
-                    self.ctx.click(*enemies[idx]); self.ctx.smart_sleep(0.4) 
+                    pos = self._safe_pos(enemies, idx, "敵方", c)
+                    if pos is None: continue
+                    self.ctx.click(*pos); self.ctx.smart_sleep(0.4) 
                     self.wait_attack_and_skip(timeout_sec=5.0, do_click=True)
                     
             elif c.startswith('N'):
@@ -263,29 +279,48 @@ class FGOCombat:
                         self.ctx.smart_sleep(1.0)
                         attack_opened = True
                     idx = int(match.group(1))
-                    self.ctx.click(*nps[idx]); self.ctx.smart_sleep(0.15) 
+                    pos = self._safe_pos(nps, idx, "寶具", c)
+                    if pos is None: continue
+                    self.ctx.click(*pos); self.ctx.smart_sleep(0.15) 
                     
             elif c.startswith('S'):
                 match = re.match(r'S(\d+)(_[a-z]+)?(?:-(\d+))?', c)
                 if match:
                     s_idx = int(match.group(1))
-                    modifier = match.group(2)[1:] if match.group(2) else None 
-                    target_pos = targets[int(match.group(3))] if match.group(3) else None
-                    self.smart_cast_skill(skills[s_idx][0], skills[s_idx][1], modifier, target_pos)
+                    modifier = match.group(2)[1:] if match.group(2) else None
+                    skill_pos = self._safe_pos(skills, s_idx, "技能", c)
+                    if skill_pos is None: continue
+                    target_pos = None
+                    if match.group(3):
+                        target_pos = self._safe_pos(targets, int(match.group(3)), "對象", c)
+                        if target_pos is None: continue
+                    self.smart_cast_skill(skill_pos[0], skill_pos[1], modifier, target_pos)
                     
             elif c.startswith('M'):
                 match = re.match(r'M(\d+)(?:-(\d+))?', c)
                 if match:
+                    # 🚀 先驗證編號，通過了才動畫面。
+                    #    這樣非法指令完全不會碰到 UI，也就不需要事後收拾。
+                    m_pos = self._safe_pos(m_skills, int(match.group(1)), "御主技能", c)
+                    if m_pos is None: continue
+                    target_pos = None
+                    if match.group(2):
+                        target_pos = self._safe_pos(targets, int(match.group(2)), "對象", c)
+                        if target_pos is None: continue
+
                     if skill_mode == "極限盲操": self.wait_attack_and_skip(timeout_sec=8.0, do_click=False); self.ctx.smart_sleep(0.2)
                     self.ctx.click(*master_btn)
                     self.ctx.smart_sleep(1.0)
-                    m_idx = int(match.group(1))
-                    target_pos = targets[int(match.group(2))] if match.group(2) else None
-                    self.smart_cast_skill(m_skills[m_idx][0], m_skills[m_idx][1], target_pos=target_pos, is_master_skill=True)
+                    self.smart_cast_skill(m_pos[0], m_pos[1], target_pos=target_pos, is_master_skill=True)
                     
             elif c.startswith('O'):
                 match = re.match(r'O-(\d+)-(\d+)', c)
                 if match:
+                    # 🚀 先驗證前後排編號，避免開了技能列才發現指令不合法
+                    f_pos = self._safe_pos(o_front, int(match.group(1)), "場上位置", c)
+                    b_pos = self._safe_pos(o_back, int(match.group(2)), "後備位置", c)
+                    if f_pos is None or b_pos is None: continue
+
                     if skill_mode == "極限盲操": self.wait_attack_and_skip(timeout_sec=8.0, do_click=False); self.ctx.smart_sleep(0.2)
                     self.ctx.click(*master_btn)
                     self.ctx.smart_sleep(1.0)
@@ -303,9 +338,8 @@ class FGOCombat:
                     self.ctx.click(*ORDER_CHANGE_SKILL)
                     self.ctx.smart_sleep(1.2)
                     
-                    f, b = int(match.group(1)), int(match.group(2))
-                    self.ctx.click(*o_front[f]); self.ctx.smart_sleep(0.3)
-                    self.ctx.click(*o_back[b]); self.ctx.smart_sleep(0.3)
+                    self.ctx.click(*f_pos); self.ctx.smart_sleep(0.3)
+                    self.ctx.click(*b_pos); self.ctx.smart_sleep(0.3)
                     self.ctx.click(*order_change_confirm_btn); self.ctx.smart_sleep(1.0) 
                     
                     self.ctx.bot.capture_screen()

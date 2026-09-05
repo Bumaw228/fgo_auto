@@ -20,7 +20,8 @@ class FGOLogic:
         self.current_state = "INIT"
         self.is_first_action = True  # 🚀 新增：用來記錄腳本是不是「剛按下開始」
         
-        self.bot = FGOBot(self.config['device_id'])
+        self.bot = FGOBot(self.config['device_id'],
+                          use_roi=self.config.get('use_roi', True))
         
         # 🌟 啟動 Context 注入模式，將自己傳遞給各大子模組
         self.vision = FGOVision(self)
