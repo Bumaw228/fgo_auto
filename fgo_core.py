@@ -1,7 +1,9 @@
 import os
 import sys
+import time
 import subprocess
 import re
+import struct
 from collections import OrderedDict
 
 import cv2
@@ -51,6 +53,44 @@ TEMPLATE_CACHE_SIZE = 60
 # 🔬 開發用：記錄每張模板實際被找到的位置，寫入 roi_log.csv
 #    收集完資料後請改回 False，否則每次命中都會寫檔
 ROI_RECORD = False
+
+# ⏱️ 開發用：統計 ADB 各類指令的耗時，用來判斷是否值得改成常駐連線。
+#    正式發布時請改回 False。
+ADB_PROFILE = False
+
+
+# ⏱️ ADB 耗時統計：{類別: [耗時(ms), ...]}
+_adb_timings = {}
+
+
+def _record_adb_time(kind, ms):
+    _adb_timings.setdefault(kind, []).append(ms)
+
+
+def print_adb_profile():
+    """印出 ADB 耗時統計。可在腳本停止時呼叫。"""
+    if not _adb_timings:
+        return
+    print("=" * 62)
+    print("⏱️  ADB 指令耗時統計")
+    print(f"{'類別':<12}{'次數':>7}{'平均':>10}{'最小':>10}{'最大':>10}{'總計':>11}")
+    print("-" * 62)
+    grand = 0.0
+    for kind in sorted(_adb_timings, key=lambda k: -sum(_adb_timings[k])):
+        v = _adb_timings[kind]
+        total = sum(v)
+        grand += total
+        print(f"{kind:<12}{len(v):>7}{total/len(v):>9.0f}ms{min(v):>9.0f}ms{max(v):>9.0f}ms{total/1000:>10.1f}s")
+    print("-" * 62)
+    print(f"{'合計':<12}{sum(len(v) for v in _adb_timings.values()):>7}{'':>29}{grand/1000:>10.1f}s")
+
+    # 常駐連線只能改善「送指令」的固定開銷，截圖因為是二進位通常無法納入
+    tap = _adb_timings.get("input", [])
+    if tap:
+        avg = sum(tap) / len(tap)
+        print(f"\n💡 點擊/滑動共 {len(tap)} 次，平均 {avg:.0f}ms、總計 {sum(tap)/1000:.1f}s")
+        print(f"   若改成常駐連線（假設可降到 10ms），約可省下 {(sum(tap) - len(tap)*10)/1000:.1f}s")
+    print("=" * 62)
 
 
 def get_base_dir():
@@ -169,7 +209,7 @@ def _verify(devices):
 class FGOBot:
     """負責與模擬器溝通的底層：截圖、點擊、影像比對。"""
 
-    def __init__(self, device_id="127.0.0.1:5555", use_roi=True):
+    def __init__(self, device_id="127.0.0.1:5555", use_roi=True, use_raw_capture=True):
         self.device_id = device_id
         self.use_roi = use_roi              # 是否啟用 ROI 加速
         self._roi_miss = {}                 # 各模板連續未命中次數
@@ -191,7 +231,9 @@ class FGOBot:
         self.tap_w = CANVAS_W
         self.tap_h = CANVAS_H
 
-        self._use_exec_out = True   # 先試 exec-out，失敗再退回 shell screencap
+        # 截圖模式：raw 最快 → png_exec → png_shell，失敗會自動往後退且不再回頭
+        self._capture_mode = 'raw' if use_raw_capture else 'png_exec'
+        self._raw_verified = not use_raw_capture   # 首次成功截圖後會做一次正確性驗證
 
         os.makedirs(self.sys_path, exist_ok=True)
         os.makedirs(os.path.join(self.friend_path, "servants"), exist_ok=True)
@@ -209,6 +251,7 @@ class FGOBot:
         逾時會強制殺掉卡住的 adb 客戶端行程，避免 adb.exe 越積越多。
         """
         cmd = [ADB_EXE, "-s", self.device_id] + command.split()
+        t0 = time.perf_counter() if ADB_PROFILE else None
         try:
             return subprocess.run(
                 cmd, capture_output=True, timeout=timeout,
@@ -220,6 +263,19 @@ class FGOBot:
             print("❌ [ADB] 找不到 adb 執行檔，請確認已加入系統 PATH")
         except Exception as e:
             print(f"⚠️ [ADB] 執行失敗: {e}")
+        finally:
+            if t0 is not None:
+                ms = (time.perf_counter() - t0) * 1000
+                # 依指令類型分類：input=點擊/滑動、screencap=截圖、其他
+                head = command.split()
+                kind = "other"
+                if "input" in head:
+                    kind = "input"
+                elif "screencap" in head:
+                    kind = "screencap_png" if "-p" in head else "screencap_raw"
+                elif "wm" in head:
+                    kind = "wm size"
+                _record_adb_time(kind, ms)
         # 統一回傳一個「失敗但結構完整」的物件，呼叫端不用額外判 None
         return subprocess.CompletedProcess(cmd, 1, b'', b'')
 
@@ -256,34 +312,116 @@ class FGOBot:
     # ==========================================
     # 📸 截圖
     # ==========================================
+    def _decode_raw_screencap(self, data):
+        """解析 `adb exec-out screencap` 的原始輸出。
+
+        格式為：width(4) height(4) format(4) [colorSpace(4), Android 13+ 才有]
+        之後接著 w*h*bpp 的像素資料。省掉裝置端的 PNG 壓縮與本機解壓，
+        是這條路徑比 `screencap -p` 快的主因。
+        """
+        if data is None or len(data) < 16:
+            return None
+        try:
+            w, h, fmt = struct.unpack('<III', data[:12])
+        except Exception:
+            return None
+        if not (0 < w <= 10000 and 0 < h <= 10000):
+            return None
+
+        px = w * h
+        # 標頭長度依 Android 版本而異，兩種都試
+        for header in (12, 16):
+            body = len(data) - header
+            try:
+                if fmt in (1, 2) and body == px * 4:        # RGBA_8888 / RGBX_8888
+                    arr = np.frombuffer(data, dtype=np.uint8, count=px * 4, offset=header)
+                    return cv2.cvtColor(arr.reshape(h, w, 4), cv2.COLOR_RGBA2BGR)
+                if fmt == 3 and body == px * 3:             # RGB_888
+                    arr = np.frombuffer(data, dtype=np.uint8, count=px * 3, offset=header)
+                    return cv2.cvtColor(arr.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+            except Exception:
+                continue
+        return None
+
+    def _verify_raw_mode(self, raw_img):
+        """驗證 raw 解析結果是否正確（只在第一次成功截圖後執行一次）。
+
+        raw 最危險的失敗模式不是報錯，而是「解析成功但色彩通道順序錯誤」——
+        程式不會發現，只會讓所有模板比對失敗，症狀是腳本什麼都不做。
+        這裡立刻再抓一張 PNG 來對照，確認兩者一致才繼續使用 raw。
+        """
+        self._raw_verified = True
+        print("🔬 [截圖] 正在驗證 raw 模式正確性...")
+
+        result = self.adb_shell("exec-out screencap -p", timeout=15)
+        if not result.stdout:
+            print("⚠️ [截圖] 驗證用的 PNG 抓取失敗，暫且信任 raw 模式")
+            return True
+
+        png_img = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
+        if png_img is None or png_img.shape != raw_img.shape:
+            print("⚠️ [截圖] 兩者尺寸不一致，停用 raw 模式")
+            self._capture_mode = 'png_exec'
+            return False
+
+        # 縮小再比對：降低運算量，也讓畫面動畫造成的細微差異不致放大
+        small = (480, 270)
+        a = cv2.resize(raw_img, small).astype(np.int16)
+        b = cv2.resize(png_img, small).astype(np.int16)
+
+        d_normal = float(np.mean(np.abs(a - b)))
+        d_swapped = float(np.mean(np.abs(a[:, :, ::-1] - b)))   # 通道順序顛倒的情況
+
+        print(f"🔬 [截圖] 色差比對 → 正常順序 {d_normal:.1f} / 顛倒順序 {d_swapped:.1f}")
+
+        if d_swapped < d_normal * 0.5:
+            print("⚠️ [截圖] 偵測到色彩通道順序相反，已停用 raw 模式改用 PNG")
+            print("   → 請將此訊息回報給開發者，以便支援你的模擬器")
+            self._capture_mode = 'png_exec'
+            return False
+
+        # 兩張圖之間隔了幾百毫秒，動畫會造成一定差異，門檻放寬到 40
+        if d_normal > 40:
+            print(f"⚠️ [截圖] raw 與 PNG 差異過大 ({d_normal:.1f})，保守起見停用 raw 模式")
+            self._capture_mode = 'png_exec'
+            return False
+
+        print("✅ [截圖] raw 模式驗證通過，將使用高速截圖")
+        return True
+
     def capture_screen(self):
         """擷取畫面並正規化成 1920x1080 供邏輯判斷。"""
-        raw_bytes = None
+        raw_img = None
 
-        # exec-out 走 binary 通道，不會有換行被轉譯的問題，也比較快
-        if self._use_exec_out:
+        # 1) raw：不做 PNG 壓縮，最快
+        if self._capture_mode == 'raw':
+            result = self.adb_shell("exec-out screencap", timeout=15)
+            raw_img = self._decode_raw_screencap(result.stdout)
+            if raw_img is None:
+                print("⚠️ [截圖] raw 模式無法解析，改用 PNG 模式")
+                self._capture_mode = 'png_exec'
+            elif not self._raw_verified:
+                # 第一次成功解析時做一次正確性驗證，不通過就永久退回 PNG
+                if not self._verify_raw_mode(raw_img):
+                    raw_img = None
+
+        # 2) PNG over exec-out：binary 通道，不會有換行被轉譯的問題
+        if raw_img is None and self._capture_mode == 'png_exec':
             result = self.adb_shell("exec-out screencap -p", timeout=15)
             if result.stdout:
-                raw_bytes = result.stdout
-            else:
-                print("⚠️ [截圖] exec-out 無回應，改用 shell screencap")
-                self._use_exec_out = False
+                raw_img = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
+            if raw_img is None:
+                print("⚠️ [截圖] exec-out 失敗，改用 shell screencap")
+                self._capture_mode = 'png_shell'
 
-        if raw_bytes is None:
+        # 3) 舊式 shell：需手動修補被轉譯的換行（有些裝置是 \r\r\n）
+        if raw_img is None and self._capture_mode == 'png_shell':
             result = self.adb_shell("shell screencap -p", timeout=15)
-            if not result.stdout:
-                self.current_screen = None
-                self.current_screen_gray = None
-                return False
-            # 舊路徑要手動修掉被轉譯的換行（有些裝置是 \r\r\n）
-            raw_bytes = result.stdout.replace(b'\r\r\n', b'\n').replace(b'\r\n', b'\n')
+            if result.stdout:
+                fixed = result.stdout.replace(b'\r\r\n', b'\n').replace(b'\r\n', b'\n')
+                raw_img = cv2.imdecode(np.frombuffer(fixed, np.uint8), cv2.IMREAD_COLOR)
 
-        raw_img = cv2.imdecode(np.frombuffer(raw_bytes, np.uint8), cv2.IMREAD_COLOR)
         if raw_img is None:
-            # exec-out 解碼失敗的話，下次自動退回舊方式再試
-            if self._use_exec_out:
-                self._use_exec_out = False
-                print("⚠️ [截圖] 解碼失敗，下次改用 shell screencap")
             self.current_screen = None
             self.current_screen_gray = None
             return False
@@ -291,7 +429,6 @@ class FGOBot:
         self.raw_h, self.raw_w = raw_img.shape[:2]
 
         if (self.raw_w, self.raw_h) != (CANVAS_W, CANVAS_H):
-            # 縮小用 INTER_AREA 畫質最好，模板比對分數會比較穩
             interp = cv2.INTER_AREA if self.raw_w > CANVAS_W else cv2.INTER_LINEAR
             self.current_screen = cv2.resize(raw_img, (CANVAS_W, CANVAS_H), interpolation=interp)
         else:

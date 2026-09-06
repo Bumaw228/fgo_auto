@@ -1,6 +1,11 @@
 import cv2
 import numpy as np
 import os
+import time
+
+# 🔬 開發用：把每次 CD 判斷的 ROI 存成圖片並印出各項指標，
+#    用來釐清判斷失準的原因。正式發布請改回 False。
+CD_DEBUG = False
 
 from coords import SKILLS, MASTER_SKILLS, ROI_SKIP_BTN, CD_ROI_OFFSET_X, CD_ROI_OFFSET_Y
 
@@ -42,6 +47,19 @@ class FGOVision:
 
         self.skip_tpl = self._imread_gray_unicode(os.path.join(sys_path, 'skip_btn_tpl.png'))
         self.skip_mask = self._imread_gray_unicode(os.path.join(sys_path, 'skip_btn_mask.png'))
+
+        # 🔬 素材完整性檢查：尺寸不符或遮罩覆蓋率異常都會讓比對分數失準
+        for label, tpl, mask in (("從者 CD", self.cooldown_tpl, self.cooldown_mask),
+                                 ("御主 CD", self.master_cooldown_tpl, self.master_cooldown_mask)):
+            if tpl is None or mask is None:
+                print(f"⚠️ [素材] {label} 模板或遮罩缺失，CD 判斷將永遠回報「未在 CD」")
+                continue
+            if tpl.shape != mask.shape:
+                print(f"⚠️ [素材] {label} 模板 {tpl.shape} 與遮罩 {mask.shape} 尺寸不符，比對會失準")
+            cover = float(np.mean(mask > 128)) * 100
+            print(f"🔬 [素材] {label} 模板 {tpl.shape[1]}x{tpl.shape[0]}，遮罩覆蓋率 {cover:.1f}%")
+            if cover < 3 or cover > 70:
+                print(f"   ⚠️ 覆蓋率異常（正常約 10~40%），遮罩可能製作有誤")
 
     def check_skip_button(self):
         if self.skip_tpl is None or self.skip_mask is None: 
@@ -98,6 +116,32 @@ class FGOVision:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         return np.mean(hsv[:, :, 1]), np.mean(hsv[:, :, 2])
 
+    def _dump_cd_debug(self, x, y, roi, tpl, mask, score, is_master):
+        """把判斷用的 ROI 存檔並印出各項指標，供人工比對真實狀態。"""
+        try:
+            out_dir = os.path.join(self.ctx.bot.base_dir, "cd_debug")
+            os.makedirs(out_dir, exist_ok=True)
+
+            # 亮白像素比例：CD 時疊在圖示上的「剩餘」字樣是高亮低飽和
+            colour = self.ctx.bot.current_screen
+            h, w = colour.shape[:2]
+            y1, y2 = max(0, y), min(h, y + CD_ROI_OFFSET_Y)
+            x1, x2 = max(0, x - CD_ROI_OFFSET_X), min(w, x + CD_ROI_OFFSET_X)
+            patch = colour[y1:y2, x1:x2]
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            bright_white = np.mean((hsv[:, :, 2] > 180) & (hsv[:, :, 1] < 60)) * 100
+            mean_v = float(np.mean(hsv[:, :, 2]))
+
+            role = "master" if is_master else "servant"
+            print(f"🔬 [CD 診斷] {role} ({x},{y}) | 模板分數 {score:.3f} "
+                  f"| 平均亮度 {mean_v:.0f} | 亮白像素 {bright_white:.1f}% "
+                  f"| ROI {roi.shape[1]}x{roi.shape[0]} | 模板 {tpl.shape[1]}x{tpl.shape[0]}")
+
+            name = f"{time.strftime('%H%M%S')}_{role}_{x}_{y}_s{score:.3f}_w{bright_white:.0f}.png"
+            cv2.imencode('.png', patch)[1].tofile(os.path.join(out_dir, name))
+        except Exception as e:
+            print(f"⚠️ [CD 診斷] 輸出失敗: {e}")
+
     def check_skill_cooldown_visual(self, x, y, is_master=False):
         if self.ctx.bot.current_screen_gray is None: return False
         tpl = self.master_cooldown_tpl if is_master else self.cooldown_tpl
@@ -116,9 +160,20 @@ class FGOVision:
 
         res = cv2.matchTemplate(roi, tpl, cv2.TM_CCORR_NORMED, mask=mask)
         _, max_val, _, _ = cv2.minMaxLoc(res)
-        
+
+        # 🚀 TM_CCORR_NORMED 搭配遮罩有機會算出 NaN/inf。
+        #    若不處理，NaN >= 0.75 會是 False，等於誤判成「沒有 CD」，
+        #    然後去點一個根本放不出來的技能。
+        if np.isnan(max_val) or np.isinf(max_val):
+            print(f"⚠️ [視覺] 座標({x},{y}) CD 比對結果異常 (NaN)，保守視為未在 CD")
+            return False
+
         role_str = "御主" if is_master else "從者"
         print(f"🔍 [視覺 2.0] 座標({x},{y}) {role_str} CD 得分: {max_val:.3f}")
+
+        if CD_DEBUG:
+            self._dump_cd_debug(x, y, roi, tpl, mask, max_val, is_master)
+
         return max_val >= 0.75
 
     def check_skill_available_batch(self, is_master=False):
@@ -150,6 +205,8 @@ class FGOVision:
             if tpl is not None and roi.shape[0] >= tpl.shape[0] and roi.shape[1] >= tpl.shape[1]:
                 res = cv2.matchTemplate(roi, tpl, cv2.TM_CCORR_NORMED, mask=mask)
                 _, max_val, _, _ = cv2.minMaxLoc(res)
+                if np.isnan(max_val) or np.isinf(max_val):
+                    max_val = 0.0
                 if max_val >= 0.75:
                     available_list.append(False)
                     continue

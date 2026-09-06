@@ -8,6 +8,8 @@ from coords import (
     SKILLS, MASTER_SKILLS, MASTER_BTN, TARGETS, ENEMIES, NP_CARDS,
     CARDS, ATTACK_BTN, BLANK_SPOT, SERVANT_PORTRAIT,
     ORDER_FRONT, ORDER_BACK, ORDER_CONFIRM_BTN, ORDER_CHANGE_SKILL,
+    ORDER_CONFIRM_BRIGHT, ORDER_CHANGE_MAX_RETRY, ORDER_DEBUG,
+    SKIP_CLICK_EVERY,
     AI_TARGET_POSITIONS,
 )
 
@@ -17,14 +19,16 @@ class FGOCombat:
         self.current_wave = 0
 
     def reset_battle_state_if_needed(self):
-        print("🔄 [戰鬥狀態檢查] 掃描是否需要洗白 UI...")
-        self.ctx.bot.capture_screen()
-        
-        if self.ctx.bot.find_in_folder('system', 'attack.png', click_it=False):
-            print("✅ [智慧跳過] 畫面已是乾淨的戰鬥首頁，不執行強制洗白，直接開打！")
-            return
+        print("🔄 [啟動防護] 從戰鬥中啟動，執行 UI 強制重置...")
+        bot = self.ctx.bot
+        bot.capture_screen()
 
-        print("⚠️ [系統初始化] 未偵測到 Attack，可能卡在技能或御主選單，執行戰鬥狀態強制重置...")
+        # 🚀 這裡刻意「不做智慧判斷」，一律執行重置。原因：
+        #    1. 只看 Attack 按鈕不夠 —— 御主技能欄展開時 Attack 仍然看得見
+        #    2. 想改看 order_change_btn 也不行 —— 該技能進 CD 後外觀會變（變暗＋剩餘字樣），
+        #       而且不是每個御主禮裝都有換人技能
+        #    這個重置整個腳本執行期間只會跑一次，約 5 秒，
+        #    用固定成本換取「絕不誤判」，對長時間掛機而言划算得多。
         
         if self.ctx.bot.find_in_folder('system', 'servant_detail_close_x.png', click_it=True):
             print("✅ 偵測到角色詳情已在開啟狀態，直接關閉洗白 UI！")
@@ -57,24 +61,33 @@ class FGOCombat:
     def wait_attack_and_skip(self, timeout_sec=15.0, do_click=True):
         if not self.ctx.running: return
         
-        # 🚀 終極解法：雙階段等待法 (Two-Phase Wait)
+        # 🚀 雙階段等待法 (Two-Phase Wait)
+        # 每次點擊都是一趟 ADB 呼叫（約 110ms），而 FGO 只要點一下就會跳過動畫，
+        # 因此改成每 SKIP_CLICK_EVERY 輪才點一次，仍保有防 lag 的冗餘。
+        loops = 0
+
         # 階段一：等待 Attack 按鈕「消失」（代表技能動畫開始）
         animation_started = False
         timeout_start = time.time() + 1.5 # 最多等 1.5 秒讓 UI 消失
         while time.time() < timeout_start and self.ctx.running:
-            if do_click: self.ctx.click(*BLANK_SPOT, duration=50) 
+            if do_click and loops % SKIP_CLICK_EVERY == 0:
+                self.ctx.click(*BLANK_SPOT, duration=50)
+            loops += 1
             self.ctx.bot.capture_screen()
             if not self.ctx.bot.find_in_folder('system', 'attack.png', click_it=False):
                 animation_started = True
                 break
             self.ctx.smart_sleep(0.15)
-            
+
         # 階段二：如果 Attack 按鈕真的消失了，才耐心等待它「重新出現」（動畫結束）
         # 如果第一階段等了 1.5 秒都沒消失，代表那是瞬間發動的 Buff，直接跳過階段二！
         if animation_started:
+            loops = 0   # 動畫剛開始，重新計數確保第一輪就點一下
             timeout_end = time.time() + timeout_sec
             while time.time() < timeout_end and self.ctx.running:
-                if do_click: self.ctx.click(*BLANK_SPOT, duration=50) 
+                if do_click and loops % SKIP_CLICK_EVERY == 0:
+                    self.ctx.click(*BLANK_SPOT, duration=50)
+                loops += 1
                 self.ctx.bot.capture_screen()
                 if self.ctx.bot.find_in_folder('system', 'attack.png', click_it=False):
                     break
@@ -240,6 +253,77 @@ class FGOCombat:
             return None
         return table[idx]
 
+    def _log_confirm_brightness(self, stage):
+        """開發用：印出確定鈕當下的亮度，供校準 ORDER_CONFIRM_BRIGHT。"""
+        if not ORDER_DEBUG:
+            return
+        self.ctx.bot.capture_screen()
+        pos = self.ctx.bot.find_in_folder('system', 'order_change_confirm_btn.png', click_it=False)
+        if pos:
+            _, v = self.ctx.vision.get_skill_color_stats(pos[0], pos[1])
+            print(f"🔬 [換人診斷] {stage}｜確定鈕亮度 {v:.0f}（目前門檻 {ORDER_CONFIRM_BRIGHT}）")
+        else:
+            print(f"🔬 [換人診斷] {stage}｜畫面上找不到確定鈕")
+
+    def _order_change_state(self):
+        """判斷換人面板目前的狀態。
+
+        回傳 (面板是否開啟, 確定鈕是否為可按的亮色, 亮度值)。
+        確定鈕在面板開啟期間一直存在，只是前後排都選滿之前呈暗色，
+        所以「亮不亮」才是判斷選取是否完成的依據。
+        """
+        self.ctx.bot.capture_screen()
+        pos = self.ctx.bot.find_in_folder('system', 'order_change_confirm_btn.png', click_it=False)
+        if not pos:
+            return False, False, 0.0
+        _, v = self.ctx.vision.get_skill_color_stats(pos[0], pos[1])
+        return True, v > ORDER_CONFIRM_BRIGHT, float(v)
+
+    def _do_order_change(self, f_pos, b_pos):
+        """執行一次換人，並在失敗時重試。
+
+        失敗有三種可能：前排沒點到、後排沒點到、確定鈕沒點到。
+        這裡不去猜是哪一種，而是直接看確定鈕的狀態：
+          亮著 = 兩邊都選好了，純粹是確定鈕沒點到 → 重按確定
+          暗著 = 選取不完整 → 依序補點前後排（點到已選中的會取消，
+                 所以每點一次就重新確認一次狀態，最多幾次就會收斂）
+        """
+        self._log_confirm_brightness("尚未選取")
+        self.ctx.click(*f_pos); self.ctx.smart_sleep(0.3)
+        self.ctx.click(*b_pos); self.ctx.smart_sleep(0.3)
+        self._log_confirm_brightness("前後排都已選取")   # ← 這行印出的就是「可按」狀態的亮度
+        self.ctx.click(*ORDER_CONFIRM_BTN); self.ctx.smart_sleep(1.0)
+
+        for attempt in range(1, ORDER_CHANGE_MAX_RETRY + 1):
+            if not self.ctx.running:
+                return False
+            is_open, ready, v = self._order_change_state()
+
+            if not is_open:
+                if attempt > 1:
+                    print(f"✅ 換人成功（第 {attempt - 1} 次重試）")
+                return True
+
+            print(f"⚠️ 換人未完成（第 {attempt} 次檢查）｜確定鈕亮度 {v:.0f}"
+                  f"（門檻 {ORDER_CONFIRM_BRIGHT}）→ {'可按' if ready else '尚未選滿'}")
+
+            if ready:
+                self.ctx.click(*ORDER_CONFIRM_BTN); self.ctx.smart_sleep(1.0)
+                continue
+
+            # 選取不完整：補點前排，若仍未選滿再補後排
+            self.ctx.click(*f_pos); self.ctx.smart_sleep(0.4)
+            _, ready, _ = self._order_change_state()
+            if not ready:
+                self.ctx.click(*b_pos); self.ctx.smart_sleep(0.4)
+            self.ctx.click(*ORDER_CONFIRM_BTN); self.ctx.smart_sleep(1.0)
+
+        is_open, _, _ = self._order_change_state()
+        if is_open:
+            print(f"❌ 換人重試 {ORDER_CHANGE_MAX_RETRY} 次仍未成功，可能是座標設定有誤")
+            return False
+        return True
+
     def execute_script_from_list(self, wave_idx):
         cmds = self.ctx.config['script_data'][wave_idx]
         if not cmds: return False 
@@ -325,27 +409,33 @@ class FGOCombat:
                     self.ctx.click(*master_btn)
                     self.ctx.smart_sleep(1.0)
 
+                    # 🚀 換人所在的御主技能格數可設定：不同御主禮裝位置未必都在第 3 格
+                    oc_slot = int(self.ctx.config.get('order_change_slot', 3))
+                    oc_skill = self._safe_pos(m_skills, oc_slot, "換人技能格", c)
+                    if oc_skill is None:
+                        self.ctx.click(*master_btn); self.ctx.smart_sleep(0.6); continue
+
                     is_order_change_cd = False
-                    self.ctx.bot.capture_screen() 
-                    s_before, v_before = self.ctx.vision.get_skill_color_stats(*ORDER_CHANGE_SKILL)
+                    self.ctx.bot.capture_screen()
+                    _, v_before = self.ctx.vision.get_skill_color_stats(*oc_skill)
                     if skill_mode == "智慧安全":
-                        if self.ctx.vision.check_skill_cooldown_visual(*ORDER_CHANGE_SKILL, is_master=True): is_order_change_cd = True
-                        elif v_before < 60: is_order_change_cd = True
+                        if self.ctx.vision.check_skill_cooldown_visual(*oc_skill, is_master=True):
+                            is_order_change_cd = True
+                        elif v_before < 60:
+                            is_order_change_cd = True
 
                     if is_order_change_cd:
-                        self.ctx.click(*MASTER_BTN); self.ctx.smart_sleep(0.6); continue 
+                        print("⏩ 換人技能處於 CD 狀態，自動跳過")
+                        self.ctx.click(*master_btn); self.ctx.smart_sleep(0.6); continue
 
-                    self.ctx.click(*ORDER_CHANGE_SKILL)
+                    self.ctx.click(*oc_skill)
                     self.ctx.smart_sleep(1.2)
-                    
-                    self.ctx.click(*f_pos); self.ctx.smart_sleep(0.3)
-                    self.ctx.click(*b_pos); self.ctx.smart_sleep(0.3)
-                    self.ctx.click(*order_change_confirm_btn); self.ctx.smart_sleep(1.0) 
-                    
-                    self.ctx.bot.capture_screen()
-                    if self.ctx.bot.find_in_folder('system', 'order_change_confirm_btn.png', click_it=False):
-                        print("⚠️ 換人失敗，請檢查座標！")
-                    
+
+                    if not self._do_order_change(f_pos, b_pos):
+                        # 重試失敗：面板可能還開著，收掉以免擋住後續指令
+                        self.ctx.click(*master_btn); self.ctx.smart_sleep(0.6)
+                        continue
+
                     self.ctx.smart_sleep(3.0)
                     self.wait_attack_and_skip(timeout_sec=20.0, do_click=True)
 

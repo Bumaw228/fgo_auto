@@ -1,5 +1,5 @@
 import time
-from fgo_core import FGOBot
+from fgo_core import FGOBot, print_adb_profile
 from fgo_vision import FGOVision
 from fgo_combat import FGOCombat
 from fgo_nav import FGONav
@@ -18,10 +18,10 @@ class FGOLogic:
         self.running = True
         self.current_loop = 1
         self.current_state = "INIT"
-        self.is_first_action = True  # 🚀 新增：用來記錄腳本是不是「剛按下開始」
         
         self.bot = FGOBot(self.config['device_id'],
-                          use_roi=self.config.get('use_roi', True))
+                          use_roi=self.config.get('use_roi', True),
+                          use_raw_capture=self.config.get('use_raw_capture', True))
         
         # 🌟 啟動 Context 注入模式，將自己傳遞給各大子模組
         self.vision = FGOVision(self)
@@ -97,28 +97,6 @@ class FGOLogic:
                 elif self.current_state == "DEFEAT":
                     self.current_state = self.nav.handle_defeat_state()
 
-                # 🚀 笨笨但最有效的「首次啟動防護」
-                # 如果這是按下開始後的第一次畫面判定，且剛好是戰鬥畫面
-                if self.is_first_action and self.current_state != "INIT":
-                    self.is_first_action = False # 只要找到任何明確的狀態，就解除啟動標記
-                    
-                    if self.current_state == "BATTLE":
-                        self.update_status("狀態：首次進入戰鬥，強制洗白 UI...", fg="orange")
-                        print("🚀 [啟動防護] 偵測到從戰鬥中啟動腳本！強制執行 UI 洗白 (無視 Attack 判斷)...")
-                        
-                        # 暴力洗白：長按角色開啟詳情，然後關閉 (這能強制覆蓋並關掉御主技能)
-                        self.click(*SERVANT_PORTRAIT, times=3, duration=50) 
-                        self.smart_sleep(1.5) 
-                        
-                        timeout = time.time() + 3.0
-                        while time.time() < timeout and self.running:
-                            self.bot.capture_screen()
-                            if self.bot.find_in_folder('system', 'servant_detail_close_x.png', click_it=True):
-                                print("✅ 成功關閉角色詳情，戰鬥 UI 已強制重置為乾淨狀態！")
-                                self.smart_sleep(1.0)
-                                break
-                            self.smart_sleep(0.2)
-
                 self.smart_sleep(0.5)
 
         except ScriptStoppedException:
@@ -126,4 +104,5 @@ class FGOLogic:
         except Exception as e: 
             print(f"Error: {e}")
         finally:
+            print_adb_profile()   # ⏱️ 腳本停止時輸出 ADB 耗時統計
             self.stop_cb()

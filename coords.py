@@ -56,8 +56,24 @@ ORDER_FRONT = [None, (205, 520), (500, 520), (805, 520)]    # 場上 3 人
 ORDER_BACK = [None, (1095, 520), (1400, 520), (1695, 520)]  # 後備 3 人
 ORDER_CONFIRM_BTN = (963, 940)
 
-# 換人功能實際佔用的是「第 3 個御主技能」的位置
-ORDER_CHANGE_SKILL = MASTER_SKILLS[3]
+# 換人預設佔用第 3 個御主技能的位置（迦勒底戰鬥服）。
+# 其他御主禮裝可能不同，實際格數由 UI 設定，這裡只是預設值。
+ORDER_CHANGE_SLOT_DEFAULT = 3
+ORDER_CHANGE_SKILL = MASTER_SKILLS[ORDER_CHANGE_SLOT_DEFAULT]
+
+# 換人確定鈕：亮度高於此值代表前後排都已選取、按鈕可按
+# 實測：未選取 100、已選取 149，取中間值兩側各留約 25 的餘裕
+ORDER_CONFIRM_BRIGHT = 125
+# 換人失敗時最多重試幾次
+ORDER_CHANGE_MAX_RETRY = 3
+
+# 等待動畫時，每隔幾輪才點一次空白處跳過動畫。
+# FGO 點一下就會跳過，不需要每輪都點；多點只是為了防止 lag 漏掉。
+# 設 1 = 每輪都點（最保險但最慢），設 3 = 一段 8 秒動畫仍會點約 5 次，冗餘足夠。
+SKIP_CLICK_EVERY = 3
+
+# 🔬 開發用：印出換人確定鈕的亮度，用來校準上面的門檻。校準完請改回 False。
+ORDER_DEBUG = False
 
 # ==========================================
 # 🎯 全自動 AI 模式的目標嘗試順序

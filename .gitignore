@@ -19,3 +19,5 @@ debug_*.png
 .idea/
 .vscode/
 .DS_Store
+
+logs/

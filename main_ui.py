@@ -7,13 +7,14 @@ import sys
 import cv2
 import subprocess 
 import json 
-from fgo_core import FGOBot, detect_devices
+from fgo_core import FGOBot, detect_devices, list_devices
 from fgo_logic import FGOLogic 
 from PIL import Image, ImageTk
 import ctypes
 import webbrowser
 import traceback # 🚀 新增：用來捕捉詳細錯誤訊息
 from updater import check_for_update_async, download_and_apply_async, CURRENT_VERSION
+import fgo_logger
 
 # ==============================
 # 🚀 終極路徑解決方案：防禦 _internal 陷阱與打包路徑問題
@@ -93,6 +94,7 @@ class FGOApp:
         self.loop_target = tk.StringVar(value="0") 
         self.extreme_sleep = tk.StringVar(value="2.5")
         self.skill_mode = tk.StringVar(value="智慧安全")
+        self.order_change_slot = tk.StringVar(value="3")
         
         self.skill_mode.trace_add("write", self.toggle_extreme_sleep_ui)
         
@@ -103,6 +105,7 @@ class FGOApp:
         self.interlude_mode = tk.BooleanVar(value=False)
         self.smart_turn_mode = tk.BooleanVar(value=False)
         self.use_roi = tk.BooleanVar(value=True)
+        self.use_raw_capture = tk.BooleanVar(value=True)
 
         self.script_data = [[], [], []] 
         self.target_servant_paths = [None, None, None]
@@ -140,6 +143,8 @@ class FGOApp:
 
         # 🚀 自動載入上次使用的設定檔
         self.auto_load_last_profile()
+        # 🚀 開程式就先確認 ADB 連線狀態，不用等使用者按「自動偵測」
+        self.root.after(300, self.check_connection_async)
         # 🚀 延遲 1.5 秒再檢查更新，讓視窗先畫完再說
         self.root.after(1500, self.check_update)
 
@@ -163,8 +168,11 @@ class FGOApp:
         ctk.CTkButton(top_frame, text="自動偵測", command=self.detect_adb, width=80).pack(side=tk.LEFT, padx=5)
         ctk.CTkButton(top_frame, text="截圖測試", command=self.test_connection, width=80, fg_color="#6c757d", hover_color="#5a6268").pack(side=tk.LEFT, padx=5)
         
-        self.led_indicator = ctk.CTkLabel(top_frame, text="●", text_color="red", font=("Arial", 28))
-        self.led_indicator.pack(side=tk.LEFT, padx=10)
+        self.led_indicator = ctk.CTkLabel(top_frame, text="●", text_color="gray", font=("Arial", 28))
+        self.led_indicator.pack(side=tk.LEFT, padx=(10, 2))
+        # 只靠顏色不夠清楚，補一段文字說明目前連線狀態
+        self.lbl_conn = ctk.CTkLabel(top_frame, text="尚未檢查", text_color="gray", font=("Arial", 13))
+        self.lbl_conn.pack(side=tk.LEFT)
 
         # 中央：四大分頁
         self.tabview = ctk.CTkTabview(self.root)
@@ -342,12 +350,25 @@ class FGOApp:
         ctk.CTkCheckBox(switch_frame, text="幕間劇情模式 (註：主線複雜選項尚未完全支援)", variable=self.interlude_mode, font=("Arial", 14)).pack(pady=10, anchor="w")
         ctk.CTkCheckBox(switch_frame, text="自動編隊 (每次出擊強制點「自動編成」刷絆用)", variable=self.auto_formation, font=("Arial", 14)).pack(pady=10, anchor="w")
         ctk.CTkCheckBox(switch_frame, text="智能對齊 Wave (讀取右上角 1/3, 2/3)", variable=self.smart_turn_mode, font=("Arial", 14)).pack(pady=10, anchor="w")
-        ctk.CTkCheckBox(switch_frame, text="ROI 加速 (限定搜尋範圍，大幅提升判斷速度)", variable=self.use_roi, font=("Arial", 14)).pack(pady=10, anchor="w")
+        accel_f = ctk.CTkFrame(switch_frame, fg_color=("gray95", "gray20"), corner_radius=8)
+        accel_f.pack(pady=(15, 5), fill="x")
+        ctk.CTkLabel(accel_f, text="⚡ 加速選項", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
+        ctk.CTkCheckBox(accel_f, text="ROI 加速 (限定影像搜尋範圍)", variable=self.use_roi,
+                        font=("Arial", 14)).pack(pady=4, padx=12, anchor="w")
+        ctk.CTkCheckBox(accel_f, text="高速截圖 (免壓縮傳輸，截圖速度約快一倍)", variable=self.use_raw_capture,
+                        font=("Arial", 14)).pack(pady=4, padx=12, anchor="w")
+        ctk.CTkLabel(accel_f, text="兩者皆會自動偵測異常並退回安全模式，遇到問題可手動取消勾選",
+                     text_color="gray", font=("Arial", 11), justify="left").pack(anchor="w", padx=12, pady=(0, 10))
 
         mode_f = ctk.CTkFrame(switch_frame, fg_color="transparent"); mode_f.pack(pady=5, anchor="w")
         ctk.CTkLabel(mode_f, text="技能施放模式:", font=("Arial", 14)).pack(side=tk.LEFT)
         self.create_dropdown(mode_f, self.skill_mode, ["智慧安全", "標準無腦", "極限盲操"], 110).pack(side=tk.LEFT, padx=10)
         
+        oc_f = ctk.CTkFrame(switch_frame, fg_color="transparent"); oc_f.pack(pady=5, anchor="w")
+        ctk.CTkLabel(oc_f, text="換人(Order Change)位於御主技能第:", font=("Arial", 14)).pack(side=tk.LEFT)
+        self.create_dropdown(oc_f, self.order_change_slot, ["1", "2", "3"], 60).pack(side=tk.LEFT, padx=8)
+        ctk.CTkLabel(oc_f, text="格　(迦勒底戰鬥服為第 3 格)", text_color="gray", font=("Arial", 12)).pack(side=tk.LEFT)
+
         self.lbl_extreme_sleep = ctk.CTkLabel(mode_f, text="盲等(秒):", font=("Arial", 14))
         self.lbl_extreme_sleep.pack(side=tk.LEFT)
         self.entry_extreme_sleep = ctk.CTkSlider(
@@ -369,6 +390,10 @@ class FGOApp:
         
         self.btn_save_screenshot = ctk.CTkButton(btn_ss_frame, text="💾 儲存高畫質截圖", height=35, fg_color="#17a2b8", hover_color="#138496", state="disabled", command=self.save_screenshot)
         self.btn_save_screenshot.pack(side=tk.LEFT, padx=5)
+
+        ctk.CTkButton(btn_ss_frame, text="📋 開啟紀錄資料夾", height=35, width=140,
+                      fg_color="#6c757d", hover_color="#5a6268",
+                      command=fgo_logger.open_log_folder).pack(side=tk.LEFT, padx=5)
         
         self.lbl_image_preview = ctk.CTkLabel(parent, text="(截圖將顯示於此，可儲存後裁切作為助戰圖片)", width=426, height=240, fg_color="#1a1a1a", corner_radius=10)
         self.lbl_image_preview.pack(pady=10)
@@ -483,7 +508,9 @@ class FGOApp:
             'script_data': self.script_data, 'auto_formation': self.auto_formation.get(),
             'interlude_mode': self.interlude_mode.get(), 'ai_card_mode': self.ai_card_mode.get(),
             'card_priority': self.card_priority.get(), 'auto_np_mode': self.auto_np_mode.get(),
-            'use_roi': self.use_roi.get()
+            'use_roi': self.use_roi.get(),
+            'use_raw_capture': self.use_raw_capture.get(),
+            'order_change_slot': self.order_change_slot.get()
         }
 
     def _apply_profile_data(self, data):
@@ -524,6 +551,8 @@ class FGOApp:
         self.card_priority.set(data.get('card_priority', "無"))
         self.auto_np_mode.set(data.get('auto_np_mode', True))
         self.use_roi.set(data.get('use_roi', True))
+        self.use_raw_capture.set(data.get('use_raw_capture', True))
+        self.order_change_slot.set(str(data.get('order_change_slot', 3)))
         self.script_data = data.get('script_data', [[], [], []])
         self.update_script_display()
 
@@ -616,7 +645,9 @@ class FGOApp:
                     'ai_card_mode': self.ai_card_mode.get(), 'card_priority': self.card_priority.get(),
                     'auto_np_mode': self.auto_np_mode.get(), 'auto_formation': self.auto_formation.get(),
                     'interlude_mode': self.interlude_mode.get(),
-                    'use_roi': self.use_roi.get()
+                    'use_roi': self.use_roi.get(),
+                    'use_raw_capture': self.use_raw_capture.get(),
+                    'order_change_slot': int(self.order_change_slot.get())
                 }
                 
                 self.session_id += 1
@@ -672,9 +703,57 @@ class FGOApp:
         if "任務達成" not in self.label_status.cget("text"):
             self.label_status.configure(text="狀態：已停止", text_color="#dc3545")
 
+    def set_conn_state(self, state, text):
+        """更新連線指示燈。state: connected / checking / disconnected"""
+        colour = {"connected": "#28a745", "checking": "#ffc107", "disconnected": "#dc3545"}
+        c = colour.get(state, "gray")
+        self.led_indicator.configure(text_color=c)
+        self.lbl_conn.configure(text=text, text_color=c)
+
+    def check_connection_async(self):
+        """在背景確認目前填入的位址是否真的連得上。
+
+        只查詢不主動連線，所以很快；若填入的位址不通、而剛好只有一台裝置在線，
+        就順手帶入，省去使用者再按一次「自動偵測」。
+        """
+        self.set_conn_state("checking", "檢查中...")
+
+        def worker():
+            try:
+                devices = list_devices()
+            except Exception as e:
+                print(f"[連線檢查] 失敗: {e}")
+                devices = []
+            target = self.entry_adb.get().strip()
+            self.root.after(0, lambda: self._apply_conn_result(devices, target))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_conn_result(self, devices, target):
+        if target in devices:
+            self.set_conn_state("connected", "已連線")
+            print(f"[連線檢查] {target} 已連線")
+            return
+
+        if len(devices) == 1:
+            self.entry_adb.delete(0, tk.END)
+            self.entry_adb.insert(0, devices[0])
+            self.set_conn_state("connected", "已連線 (自動帶入)")
+            print(f"[連線檢查] 填入的 {target} 未連線，改用偵測到的 {devices[0]}")
+            return
+
+        if devices:
+            self.set_conn_state("disconnected", f"未連線 (偵測到 {len(devices)} 台)")
+            print(f"[連線檢查] {target} 未連線，可用裝置: {devices}")
+            return
+
+        self.set_conn_state("disconnected", "未連線 (請按自動偵測)")
+        print("[連線檢查] 找不到任何已連線裝置")
+
     def detect_adb(self):
         """自動偵測模擬器（在背景執行緒跑，避免視窗假死）"""
         self.update_status_label("狀態：正在偵測設備...", "white")
+        self.set_conn_state("checking", "偵測中...")
 
         def worker():
             try:
@@ -693,12 +772,12 @@ class FGOApp:
         if devices:
             self.entry_adb.delete(0, tk.END)
             self.entry_adb.insert(0, devices[0])
-            self.led_indicator.configure(text_color="#28a745")
+            self.set_conn_state("connected", "已連線")
             self.update_status_label(f"狀態：ADB 連線成功 ({devices[0]})", "#28a745")
             extra = f"\n(共偵測到 {len(devices)} 台，已選用第一台)" if len(devices) > 1 else ""
             messagebox.showinfo("成功", f"已連線: {devices[0]}{extra}")
         else:
-            self.led_indicator.configure(text_color="#dc3545")
+            self.set_conn_state("disconnected", "未連線")
             self.update_status_label("狀態：找不到設備，請確認模擬器設定", "#dc3545")
             messagebox.showwarning("找不到設備",
                 "請確認模擬器已開啟，且已在模擬器設定中啟用「ADB 偵錯 / Root」。")
@@ -719,9 +798,11 @@ class FGOApp:
                 self.ctk_preview_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(426, 240))
                 self.lbl_image_preview.configure(image=self.ctk_preview_image, text="")
                 
-                self.btn_save_screenshot.configure(state="normal") 
+                self.btn_save_screenshot.configure(state="normal")
+                self.set_conn_state("connected", "已連線")   # 截得到圖就是真的通了
                 self.update_status_label("狀態：截圖成功，請至「系統與進階」查看並存檔", "#28a745")
             else:
+                self.set_conn_state("disconnected", "未連線")
                 self.update_status_label("狀態：擷取失敗", "#dc3545")
                 messagebox.showwarning("錯誤", "無法擷取畫面，請確認模擬器是否開啟。")
         except Exception as e:
@@ -746,6 +827,10 @@ class FGOApp:
             messagebox.showerror("圖片儲存失敗", traceback.format_exc())
 
 if __name__ == "__main__":
+    # 🚀 一定要最先呼叫：之後所有 print 都會同時寫進紀錄檔。
+    #    打包成 --noconsole 之後，這是唯一的診斷來源。
+    fgo_logger.setup_logging(CURRENT_VERSION)
+
     root = ctk.CTk()
     app = FGOApp(root)
     root.protocol("WM_DELETE_WINDOW", lambda: (app.stop_script(), root.destroy()))
