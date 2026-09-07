@@ -27,7 +27,7 @@ GITHUB_OWNER = "Bumaw228"
 GITHUB_REPO = "fgo_auto"
 
 # 🚀 每次發版都要改這裡，並讓 GitHub 上的 tag 一致（tag 打 v1.0.1，這裡寫 1.0.1）
-CURRENT_VERSION = "1.1.0"
+CURRENT_VERSION = "1.2.0"
 
 API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 

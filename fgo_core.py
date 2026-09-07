@@ -9,7 +9,7 @@ from collections import OrderedDict
 import cv2
 import numpy as np
 
-from coords import TEMPLATE_ROI, ROI_VERIFY_EVERY
+from coords import TEMPLATE_ROI, ROI_VERIFY_EVERY, LONG_PRESS_MS
 
 # ==========================================
 # 🔧 全域設定
@@ -85,7 +85,7 @@ def print_adb_profile():
     print(f"{'合計':<12}{sum(len(v) for v in _adb_timings.values()):>7}{'':>29}{grand/1000:>10.1f}s")
 
     # 常駐連線只能改善「送指令」的固定開銷，截圖因為是二進位通常無法納入
-    tap = _adb_timings.get("input", [])
+    tap = _adb_timings.get("input_tap", []) or _adb_timings.get("input_swipe", [])
     if tap:
         avg = sum(tap) / len(tap)
         print(f"\n💡 點擊/滑動共 {len(tap)} 次，平均 {avg:.0f}ms、總計 {sum(tap)/1000:.1f}s")
@@ -209,9 +209,10 @@ def _verify(devices):
 class FGOBot:
     """負責與模擬器溝通的底層：截圖、點擊、影像比對。"""
 
-    def __init__(self, device_id="127.0.0.1:5555", use_roi=True, use_raw_capture=True):
+    def __init__(self, device_id="127.0.0.1:5555", use_roi=True, use_raw_capture=True, use_tap=True):
         self.device_id = device_id
         self.use_roi = use_roi              # 是否啟用 ROI 加速
+        self.use_tap = use_tap              # 點擊改用 input tap（較快）或 input swipe（較穩）
         self._roi_miss = {}                 # 各模板連續未命中次數
         self._roi_disabled = set()          # 已確認位置不符、自動停用 ROI 的模板
         self.base_dir = get_base_dir()
@@ -270,7 +271,7 @@ class FGOBot:
                 head = command.split()
                 kind = "other"
                 if "input" in head:
-                    kind = "input"
+                    kind = "input_tap" if "tap" in head else "input_swipe"
                 elif "screencap" in head:
                     kind = "screencap_png" if "-p" in head else "screencap_raw"
                 elif "wm" in head:
@@ -451,8 +452,14 @@ class FGOBot:
 
     def smart_click(self, x, y, duration=150):
         tx, ty = self._to_tap(x, y)
-        # 用 swipe 原地不動來模擬點擊，可精確控制按壓時間
-        self.adb_shell(f"shell input swipe {tx} {ty} {tx} {ty} {duration}", timeout=5)
+
+        # input tap 不需要等待按壓時間，比 swipe 快 50~150ms。
+        # 但按壓極短，若遊戲偶爾收不到，把 coords.USE_TAP 改回 False 即可。
+        # 真正需要長按的情況（duration 夠大）一律走 swipe。
+        if self.use_tap and duration < LONG_PRESS_MS:
+            self.adb_shell(f"shell input tap {tx} {ty}", timeout=5)
+        else:
+            self.adb_shell(f"shell input swipe {tx} {ty} {tx} {ty} {duration}", timeout=5)
 
     def smart_swipe(self, x1, y1, x2, y2, duration=400):
         tx1, ty1 = self._to_tap(x1, y1)

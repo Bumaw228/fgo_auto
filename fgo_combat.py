@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import cv2
@@ -9,6 +10,7 @@ from coords import (
     CARDS, ATTACK_BTN, BLANK_SPOT, SERVANT_PORTRAIT,
     ORDER_FRONT, ORDER_BACK, ORDER_CONFIRM_BTN, ORDER_CHANGE_SKILL,
     ORDER_CONFIRM_BRIGHT, ORDER_CHANGE_MAX_RETRY, ORDER_DEBUG,
+    ORDER_SLOT_X, ORDER_SELECT_Y, ORDER_SELECT_ASSET,
     SKIP_CLICK_EVERY,
     AI_TARGET_POSITIONS,
 )
@@ -253,6 +255,104 @@ class FGOCombat:
             return None
         return table[idx]
 
+    def _close_order_change_panel(self):
+        """換人失敗時強制關閉面板，讓腳本能回到可操作的戰鬥畫面。
+
+        換人面板是覆蓋整個畫面的獨立視窗，點 master_btn 對它無效，
+        必須按右上角的叉叉（與從者詳情共用同一顆按鈕）。
+        """
+        for attempt in range(1, 4):
+            self.ctx.bot.capture_screen()
+            if not self.ctx.bot.find_in_folder('system', 'order_change_confirm_btn.png', click_it=False):
+                print("✅ 換人面板已關閉，回到戰鬥畫面")
+                return True
+            if self.ctx.bot.find_in_folder('system', 'servant_detail_close_x.png', click_it=True):
+                print(f"🚪 按下關閉鈕退出換人面板（第 {attempt} 次）")
+            else:
+                print(f"⚠️ 找不到關閉鈕（第 {attempt} 次），改點空白處嘗試脫困")
+                self.ctx.click(*BLANK_SPOT, duration=50)
+            self.ctx.smart_sleep(1.0)
+
+        print("❌ 無法關閉換人面板，後續指令可能失效")
+        return False
+
+    def _detect_order_selection(self):
+        """用畫面上的 SELECT 標記判斷前後排各選了誰。
+
+        回傳 (前排編號清單, 後排編號清單)，若素材不存在則回傳 None
+        讓呼叫端退回舊的亮度判斷法。
+
+        只用 x 座標歸屬格子：六格橫向分得很開（間距約 295px），
+        因此不需要知道 SELECT 標記相對格子的精確偏移。
+        """
+        path = os.path.join(self.ctx.bot.sys_path, ORDER_SELECT_ASSET)
+        if not os.path.exists(path):
+            return None
+
+        self.ctx.bot.capture_screen()
+        points = self.ctx.bot.find_all_by_abspath(path, threshold=0.8)
+
+        y_lo, y_hi = ORDER_SELECT_Y
+        front, back = [], []
+        for x, y in points:
+            if not (y_lo <= y <= y_hi):
+                continue          # 不在換人畫面該有的高度，視為誤判
+            for (side, idx), (x1, x2) in ORDER_SLOT_X.items():
+                if x1 <= x <= x2:
+                    (front if side == "front" else back).append(idx)
+                    break
+
+        front.sort(); back.sort()
+        if ORDER_DEBUG:
+            print(f"🔬 [換人診斷] SELECT 偵測 → 前排 {front or '無'}｜後排 {back or '無'}"
+                  f"（共找到 {len(points)} 個標記）")
+        return front, back
+
+    def _fix_side(self, side_name, slots, want, selected):
+        """讓某一排只選中 want 這一個格子。
+
+        FGO 點擊已選中的格子會取消選取，所以選錯人時要先點掉再點對的。
+        """
+        for wrong in selected:
+            if wrong != want:
+                print(f"↩️ {side_name}選到 {wrong} 不是 {want}，先取消")
+                self.ctx.click(*slots[wrong]); self.ctx.smart_sleep(0.35)
+        if want not in selected:
+            self.ctx.click(*slots[want]); self.ctx.smart_sleep(0.35)
+
+    def _do_order_change_by_select(self, f, b):
+        """以 SELECT 標記為依據執行換人。成功回傳 True，素材不存在回傳 None。"""
+        if self._detect_order_selection() is None:
+            return None
+
+        for attempt in range(1, ORDER_CHANGE_MAX_RETRY + 1):
+            if not self.ctx.running:
+                return False
+
+            state = self._detect_order_selection()
+            if state is None:
+                return None
+            front, back = state
+
+            if front == [f] and back == [b]:
+                self.ctx.click(*ORDER_CONFIRM_BTN); self.ctx.smart_sleep(1.0)
+                self.ctx.bot.capture_screen()
+                if not self.ctx.bot.find_in_folder('system', 'order_change_confirm_btn.png', click_it=False):
+                    if attempt > 1:
+                        print(f"✅ 換人成功（第 {attempt} 輪）")
+                    return True
+                print("⚠️ 確定鈕按下後面板仍在，重試")
+                continue
+
+            print(f"🔧 修正選取（第 {attempt} 輪）：目前前排 {front or '無'}／後排 {back or '無'}"
+                  f"，目標 前{f} 後{b}")
+            self._fix_side("前排", ORDER_FRONT, f, front)
+            self._fix_side("後排", ORDER_BACK, b, back)
+
+        print(f"❌ 換人重試 {ORDER_CHANGE_MAX_RETRY} 次仍未成功，改為關閉面板繼續戰鬥")
+        self._close_order_change_panel()
+        return False
+
     def _log_confirm_brightness(self, stage):
         """開發用：印出確定鈕當下的亮度，供校準 ORDER_CONFIRM_BRIGHT。"""
         if not ORDER_DEBUG:
@@ -279,7 +379,7 @@ class FGOCombat:
         _, v = self.ctx.vision.get_skill_color_stats(pos[0], pos[1])
         return True, v > ORDER_CONFIRM_BRIGHT, float(v)
 
-    def _do_order_change(self, f_pos, b_pos):
+    def _do_order_change(self, f_pos, b_pos, f_idx, b_idx):
         """執行一次換人，並在失敗時重試。
 
         失敗有三種可能：前排沒點到、後排沒點到、確定鈕沒點到。
@@ -288,6 +388,11 @@ class FGOCombat:
           暗著 = 選取不完整 → 依序補點前後排（點到已選中的會取消，
                  所以每點一次就重新確認一次狀態，最多幾次就會收斂）
         """
+        # 🚀 優先使用 SELECT 標記判斷（確定性高），素材不存在才退回亮度判斷
+        result = self._do_order_change_by_select(f_idx, b_idx)
+        if result is not None:
+            return result
+
         self._log_confirm_brightness("尚未選取")
         self.ctx.click(*f_pos); self.ctx.smart_sleep(0.3)
         self.ctx.click(*b_pos); self.ctx.smart_sleep(0.3)
@@ -320,7 +425,8 @@ class FGOCombat:
 
         is_open, _, _ = self._order_change_state()
         if is_open:
-            print(f"❌ 換人重試 {ORDER_CHANGE_MAX_RETRY} 次仍未成功，可能是座標設定有誤")
+            print(f"❌ 換人重試 {ORDER_CHANGE_MAX_RETRY} 次仍未成功，改為關閉面板繼續戰鬥")
+            self._close_order_change_panel()
             return False
         return True
 
@@ -401,8 +507,9 @@ class FGOCombat:
                 match = re.match(r'O-(\d+)-(\d+)', c)
                 if match:
                     # 🚀 先驗證前後排編號，避免開了技能列才發現指令不合法
-                    f_pos = self._safe_pos(o_front, int(match.group(1)), "場上位置", c)
-                    b_pos = self._safe_pos(o_back, int(match.group(2)), "後備位置", c)
+                    f, b = int(match.group(1)), int(match.group(2))
+                    f_pos = self._safe_pos(o_front, f, "場上位置", c)
+                    b_pos = self._safe_pos(o_back, b, "後備位置", c)
                     if f_pos is None or b_pos is None: continue
 
                     if skill_mode == "極限盲操": self.wait_attack_and_skip(timeout_sec=8.0, do_click=False); self.ctx.smart_sleep(0.2)
@@ -431,9 +538,10 @@ class FGOCombat:
                     self.ctx.click(*oc_skill)
                     self.ctx.smart_sleep(1.2)
 
-                    if not self._do_order_change(f_pos, b_pos):
-                        # 重試失敗：面板可能還開著，收掉以免擋住後續指令
-                        self.ctx.click(*master_btn); self.ctx.smart_sleep(0.6)
+                    if not self._do_order_change(f_pos, b_pos, f, b):
+                        # 面板已在 _do_order_change 內關閉，這裡直接跳過這道指令，
+                        # 讓後續流程回到正常的 Attack 選卡
+                        self.ctx.smart_sleep(0.5)
                         continue
 
                     self.ctx.smart_sleep(3.0)

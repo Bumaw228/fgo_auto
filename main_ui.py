@@ -6,7 +6,8 @@ import os
 import sys  
 import cv2
 import subprocess 
-import json 
+import json
+import re
 from fgo_core import FGOBot, detect_devices, list_devices
 from fgo_logic import FGOLogic 
 from PIL import Image, ImageTk
@@ -50,6 +51,14 @@ def write_app_config(data):
 # ==============================
 # 🌟 設置 CustomTkinter 主題與效能
 # ==============================
+# 統一的間距：區塊之間用 PAD_BLOCK，區塊內部用 PAD_ITEM。
+# 原本散落 2/5/10/15 沒有規律，是版面看起來不整齊的主因。
+PAD_BLOCK = 10
+PAD_ITEM = 4
+
+# 截圖預覽尺寸（16:9）。改這裡會同時影響版面與縮圖，兩者不會不同步。
+PREVIEW_SIZE = (320, 180)
+
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
 
@@ -63,8 +72,8 @@ class FGOApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"FGO 好玩遊戲輔助工具 v{CURRENT_VERSION}")
-        self.root.geometry("700x850") 
-        self.root.minsize(650, 800)
+        self.root.geometry("820x660")
+        self.root.minsize(780, 620)
         
         # 破解 Windows 工作列圖示
         try:
@@ -106,8 +115,11 @@ class FGOApp:
         self.smart_turn_mode = tk.BooleanVar(value=False)
         self.use_roi = tk.BooleanVar(value=True)
         self.use_raw_capture = tk.BooleanVar(value=True)
+        self.use_tap = tk.BooleanVar(value=True)
 
-        self.script_data = [[], [], []] 
+        self.script_data = [[], [], []]
+        self._script_rows = []      # 指令清單的列元件，重複使用以避免閃爍
+        self._empty_hint = None 
         self.target_servant_paths = [None, None, None]
         self.target_ce_paths = [None, None, None]
         self.selected_servants = [tk.StringVar(value="尚未選取") for _ in range(3)]
@@ -158,7 +170,7 @@ class FGOApp:
     def setup_ui(self):
         # 頂部：ADB 連線
         top_frame = ctk.CTkFrame(self.root)
-        top_frame.pack(fill="x", padx=15, pady=10)
+        top_frame.pack(fill="x", padx=15, pady=(10, 6))
         
         ctk.CTkLabel(top_frame, text="ADB 連線:", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
         self.entry_adb = ctk.CTkEntry(top_frame, width=160, font=("Arial", 14))
@@ -176,7 +188,7 @@ class FGOApp:
 
         # 中央：四大分頁
         self.tabview = ctk.CTkTabview(self.root)
-        self.tabview.pack(fill="both", expand=True, padx=15, pady=5)
+        self.tabview.pack(fill="both", expand=True, padx=15, pady=(0, 4))
         self.tabview._segmented_button.configure(font=("Arial", 15, "bold"))
         
         tab_basic = self.tabview.add("【 基本與周回 】")
@@ -191,49 +203,49 @@ class FGOApp:
 
         # 底部：控制區
         bottom_frame = ctk.CTkFrame(self.root, fg_color=("gray90", "gray12"), corner_radius=10)
-        bottom_frame.pack(side=tk.BOTTOM, fill="x", padx=15, pady=10)
+        bottom_frame.pack(side=tk.BOTTOM, fill="x", padx=15, pady=(6, 8))
 
         self.label_status = ctk.CTkLabel(bottom_frame, text="狀態：待機中", text_color="#00CFFF", font=("Arial", 16, "bold"))
-        self.label_status.pack(pady=10)
+        self.label_status.pack(pady=(8, 4))
 
         ctrl_frame = ctk.CTkFrame(bottom_frame, fg_color="transparent")
-        ctrl_frame.pack(pady=(0, 15))
+        ctrl_frame.pack(pady=(0, 10))
 
-        self.btn_start = ctk.CTkButton(ctrl_frame, text="🚀 開始", command=self.start_thread, fg_color="#28a745", hover_color="#218838", font=("Arial", 16, "bold"), width=120, height=45)
+        self.btn_start = ctk.CTkButton(ctrl_frame, text="🚀 開始", command=self.start_thread, fg_color="#28a745", hover_color="#218838", font=("Arial", 16, "bold"), width=120, height=38)
         self.btn_start.pack(side=tk.LEFT, padx=10)
 
-        self.btn_stop = ctk.CTkButton(ctrl_frame, text="🛑 停止", command=self.stop_script, fg_color="#dc3545", hover_color="#c82333", font=("Arial", 16, "bold"), width=100, height=45, state="disabled")
+        self.btn_stop = ctk.CTkButton(ctrl_frame, text="🛑 停止", command=self.stop_script, fg_color="#dc3545", hover_color="#c82333", font=("Arial", 16, "bold"), width=100, height=38, state="disabled")
         self.btn_stop.pack(side=tk.LEFT, padx=10)
 
-        self.btn_save = ctk.CTkButton(ctrl_frame, text="💾 存檔", command=self.save_profile, fg_color="#17a2b8", hover_color="#138496", font=("Arial", 16, "bold"), width=100, height=45)
+        self.btn_save = ctk.CTkButton(ctrl_frame, text="💾 存檔", command=self.save_profile, fg_color="#17a2b8", hover_color="#138496", font=("Arial", 16, "bold"), width=100, height=38)
         self.btn_save.pack(side=tk.LEFT, padx=10)
 
-        self.btn_load = ctk.CTkButton(ctrl_frame, text="📂 讀檔", command=self.load_profile, fg_color="#ffc107", hover_color="#e0a800", text_color="black", font=("Arial", 16, "bold"), width=100, height=45)
+        self.btn_load = ctk.CTkButton(ctrl_frame, text="📂 讀檔", command=self.load_profile, fg_color="#ffc107", hover_color="#e0a800", text_color="black", font=("Arial", 16, "bold"), width=100, height=38)
         self.btn_load.pack(side=tk.LEFT, padx=10)
 
     # ==============================
     # 分頁設計
     # ==============================
     def setup_tab_basic(self, parent):
-        f1 = ctk.CTkFrame(parent, fg_color="transparent"); f1.pack(fill="x", pady=10)
+        f1 = ctk.CTkFrame(parent, fg_color="transparent"); f1.pack(fill="x", pady=PAD_BLOCK)
         ctk.CTkLabel(f1, text="出擊隊伍編號:", font=("Arial", 14)).pack(side=tk.LEFT, padx=15)
         self.create_dropdown(f1, self.team_index, [str(i) for i in range(1, 16)], 80).pack(side=tk.LEFT)
         
         ctk.CTkLabel(f1, text="蘋果補充:", font=("Arial", 14)).pack(side=tk.LEFT, padx=(30, 10))
         self.create_dropdown(f1, self.apple_mode, ["不自動回體", "銅蘋果", "青銅蘋果", "銀蘋果", "金蘋果"], 120).pack(side=tk.LEFT)
 
-        f2 = ctk.CTkFrame(parent, fg_color="transparent"); f2.pack(fill="x", pady=10)
+        f2 = ctk.CTkFrame(parent, fg_color="transparent"); f2.pack(fill="x", pady=PAD_BLOCK)
         ctk.CTkLabel(f2, text="目標周回次數:", font=("Arial", 14)).pack(side=tk.LEFT, padx=15)
         ctk.CTkEntry(f2, textvariable=self.loop_target, width=80, font=("Arial", 14)).pack(side=tk.LEFT)
         ctk.CTkLabel(f2, text="(0 = 無限刷到沒體/蘋果)", text_color="gray", font=("Arial", 12)).pack(side=tk.LEFT, padx=10)
 
-        ctk.CTkLabel(parent, text="--- 戰鬥行為 ---", text_color="gray", font=("Arial", 14, "bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(parent, text="--- 戰鬥行為 ---", text_color="gray", font=("Arial", 14, "bold")).pack(pady=(12, 6))
         
         f3 = ctk.CTkFrame(parent, fg_color="transparent"); f3.pack(fill="x", pady=5)
         ctk.CTkRadioButton(f3, text="隨機選卡 (耍廢平A流)", variable=self.battle_mode, value="random", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=15)
         ctk.CTkRadioButton(f3, text="精準 3T (請至分頁設定)", variable=self.battle_mode, value="script", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=15)
 
-        f4 = ctk.CTkFrame(parent, fg_color="transparent"); f4.pack(fill="x", pady=15, padx=15)
+        f4 = ctk.CTkFrame(parent, fg_color="transparent"); f4.pack(fill="x", pady=PAD_BLOCK, padx=15)
         ctk.CTkCheckBox(f4, text="每回合自動放寶具", variable=self.auto_np_mode, font=("Arial", 14)).pack(side=tk.LEFT)
         ctk.CTkCheckBox(f4, text="啟用 AI 視覺算牌", variable=self.ai_card_mode, font=("Arial", 14)).pack(side=tk.LEFT, padx=20)
         
@@ -243,13 +255,13 @@ class FGOApp:
 
     def setup_tab_support(self, parent):
         class_frame = ctk.CTkFrame(parent, fg_color="transparent") 
-        class_frame.pack(pady=10, fill="x", padx=5)
+        class_frame.pack(pady=PAD_BLOCK, fill="x", padx=5)
         ctk.CTkLabel(class_frame, text="尋找職階：", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
         self.create_dropdown(class_frame, self.support_class, ["ALL", "Saber", "Archer", "Lancer", "Rider", "Caster", "Assassin", "Berserker", "Extra", "Mix"], 120).pack(side=tk.LEFT)
 
         img_frame = ctk.CTkFrame(parent, fg_color=("gray95", "gray20"))
         img_frame.pack(pady=5, fill="both", expand=True, padx=5)
-        ctk.CTkLabel(img_frame, text="目標圖片 (符合任一即選取，全空則盲選)", font=("Arial", 15, "bold")).pack(anchor="w", padx=15, pady=10)
+        ctk.CTkLabel(img_frame, text="目標圖片 (符合任一即選取，全空則盲選)", font=("Arial", 15, "bold")).pack(anchor="w", padx=15, pady=(8, 4))
         
         ctk.CTkLabel(img_frame, text="【從者圖片】", text_color="#4F94CD", font=("Arial", 14)).pack(anchor="w", padx=15)
         for i in range(3):
@@ -271,12 +283,15 @@ class FGOApp:
         for i in range(3):
             ctk.CTkRadioButton(wave_sel_frame, text=f"Wave {i+1}", variable=self.edit_wave_idx, value=i, command=self.update_script_display, font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=20)
 
-        self.script_display = ctk.CTkLabel(parent, text="目前指令：\n(空)", bg_color="transparent", fg_color=("white", "black"), corner_radius=10, height=80, justify="left", anchor="nw", padx=15, pady=10, font=("Consolas", 14))
-        self.script_display.pack(pady=5, fill="x", padx=10) 
-        
+        # 指令清單：每一列都能單獨上移、下移、刪除
+        self.script_list = ctk.CTkScrollableFrame(parent, fg_color=("white", "gray10"),
+                                                  corner_radius=10, height=170)
+        self.script_list.pack(pady=5, fill="both", expand=True, padx=10)
+
         act_btn_frame = ctk.CTkFrame(parent, fg_color="transparent"); act_btn_frame.pack(pady=2)
-        ctk.CTkButton(act_btn_frame, text="⏪ 刪除上一個指令", command=self.undo_last_script, fg_color="#E0721E", hover_color="#B35D1B", font=("Arial", 13, "bold"), height=30).pack(side=tk.LEFT, padx=15)
-        ctk.CTkButton(act_btn_frame, text="🗑️ 清除 Wave 全部", command=self.clear_current_script, fg_color="#C13828", hover_color="#8B2519", font=("Arial", 13, "bold"), height=30).pack(side=tk.LEFT, padx=15)
+        ctk.CTkButton(act_btn_frame, text="🗑️ 清除本 Wave", command=self.clear_current_script,
+                      fg_color="#C13828", hover_color="#8B2519",
+                      font=("Arial", 13, "bold"), height=30, width=130).pack(side=tk.LEFT, padx=15)
 
         cmd_frame = ctk.CTkFrame(parent, fg_color=("gray95", "gray20"))
         cmd_frame.pack(pady=10, padx=10, fill="x")
@@ -344,59 +359,87 @@ class FGOApp:
         ctk.CTkButton(cmd_frame, text="➕ 寫入指令", command=self.process_add_command, fg_color="#007bff", hover_color="#0056b3", font=("Arial", 14, "bold"), height=35).pack(pady=(10, 15))
 
     def setup_tab_sys(self, parent):
-        switch_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        switch_frame.pack(pady=5, fill="x", padx=10)
-        
-        ctk.CTkCheckBox(switch_frame, text="幕間劇情模式 (註：主線複雜選項尚未完全支援)", variable=self.interlude_mode, font=("Arial", 14)).pack(pady=10, anchor="w")
-        ctk.CTkCheckBox(switch_frame, text="自動編隊 (每次出擊強制點「自動編成」刷絆用)", variable=self.auto_formation, font=("Arial", 14)).pack(pady=10, anchor="w")
-        ctk.CTkCheckBox(switch_frame, text="智能對齊 Wave (讀取右上角 1/3, 2/3)", variable=self.smart_turn_mode, font=("Arial", 14)).pack(pady=10, anchor="w")
-        accel_f = ctk.CTkFrame(switch_frame, fg_color=("gray95", "gray20"), corner_radius=8)
-        accel_f.pack(pady=(15, 5), fill="x")
-        ctk.CTkLabel(accel_f, text="⚡ 加速選項", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
+        """系統與進階：左右兩欄配置。
+
+        原本所有元件擠成一長條，把視窗高度撐到 850px。
+        改成左欄放設定、右欄放截圖工具之後，這一頁的高度需求幾乎減半。
+        """
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=6, pady=PAD_BLOCK)
+        wrap.grid_columnconfigure(0, weight=3)
+        wrap.grid_columnconfigure(1, weight=2)
+        wrap.grid_rowconfigure(0, weight=1)
+
+        # ── 左欄：功能開關與模式 ──────────────────────
+        left = ctk.CTkFrame(wrap, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        ctk.CTkCheckBox(left, text="幕間劇情模式 (主線複雜選項尚未完全支援)",
+                        variable=self.interlude_mode, font=("Arial", 14)).pack(pady=PAD_ITEM, anchor="w")
+        ctk.CTkCheckBox(left, text="自動編隊 (每次出擊強制點「自動編成」刷絆用)",
+                        variable=self.auto_formation, font=("Arial", 14)).pack(pady=PAD_ITEM, anchor="w")
+        ctk.CTkCheckBox(left, text="智能對齊 Wave (讀取右上角 1/3, 2/3)",
+                        variable=self.smart_turn_mode, font=("Arial", 14)).pack(pady=PAD_ITEM, anchor="w")
+
+        accel_f = ctk.CTkFrame(left, fg_color=("gray95", "gray20"), corner_radius=8)
+        accel_f.pack(pady=(PAD_BLOCK, PAD_ITEM), fill="x")
+        ctk.CTkLabel(accel_f, text="⚡ 加速選項", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(6, 2))
         ctk.CTkCheckBox(accel_f, text="ROI 加速 (限定影像搜尋範圍)", variable=self.use_roi,
-                        font=("Arial", 14)).pack(pady=4, padx=12, anchor="w")
-        ctk.CTkCheckBox(accel_f, text="高速截圖 (免壓縮傳輸，截圖速度約快一倍)", variable=self.use_raw_capture,
-                        font=("Arial", 14)).pack(pady=4, padx=12, anchor="w")
-        ctk.CTkLabel(accel_f, text="兩者皆會自動偵測異常並退回安全模式，遇到問題可手動取消勾選",
-                     text_color="gray", font=("Arial", 11), justify="left").pack(anchor="w", padx=12, pady=(0, 10))
+                        font=("Arial", 14)).pack(pady=PAD_ITEM, padx=12, anchor="w")
+        ctk.CTkCheckBox(accel_f, text="高速截圖 (截圖速度約快一倍)", variable=self.use_raw_capture,
+                        font=("Arial", 14)).pack(pady=PAD_ITEM, padx=12, anchor="w")
+        ctk.CTkCheckBox(accel_f, text="快速點擊 (每次點擊約快 70ms)", variable=self.use_tap,
+                        font=("Arial", 14)).pack(pady=PAD_ITEM, padx=12, anchor="w")
+        ctk.CTkLabel(accel_f, text="皆會自動偵測異常並退回安全模式，遇到問題可取消勾選",
+                     text_color="gray", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(0, 8))
 
-        mode_f = ctk.CTkFrame(switch_frame, fg_color="transparent"); mode_f.pack(pady=5, anchor="w")
+        mode_f = ctk.CTkFrame(left, fg_color="transparent"); mode_f.pack(pady=PAD_ITEM, anchor="w", fill="x")
         ctk.CTkLabel(mode_f, text="技能施放模式:", font=("Arial", 14)).pack(side=tk.LEFT)
-        self.create_dropdown(mode_f, self.skill_mode, ["智慧安全", "標準無腦", "極限盲操"], 110).pack(side=tk.LEFT, padx=10)
-        
-        oc_f = ctk.CTkFrame(switch_frame, fg_color="transparent"); oc_f.pack(pady=5, anchor="w")
-        ctk.CTkLabel(oc_f, text="換人(Order Change)位於御主技能第:", font=("Arial", 14)).pack(side=tk.LEFT)
-        self.create_dropdown(oc_f, self.order_change_slot, ["1", "2", "3"], 60).pack(side=tk.LEFT, padx=8)
-        ctk.CTkLabel(oc_f, text="格　(迦勒底戰鬥服為第 3 格)", text_color="gray", font=("Arial", 12)).pack(side=tk.LEFT)
+        self.create_dropdown(mode_f, self.skill_mode, ["智慧安全", "標準無腦", "極限盲操"], 110).pack(side=tk.LEFT, padx=8)
 
-        self.lbl_extreme_sleep = ctk.CTkLabel(mode_f, text="盲等(秒):", font=("Arial", 14))
+        sleep_f = ctk.CTkFrame(left, fg_color="transparent"); sleep_f.pack(pady=PAD_ITEM, anchor="w", fill="x")
+        self.lbl_extreme_sleep = ctk.CTkLabel(sleep_f, text="盲等(秒):", font=("Arial", 14))
         self.lbl_extreme_sleep.pack(side=tk.LEFT)
         self.entry_extreme_sleep = ctk.CTkSlider(
-            mode_f, from_=0.5, to=6.0, number_of_steps=55,
-            command=lambda v: self.extreme_sleep.set(f"{v:.1f}"), width=200
+            sleep_f, from_=0.5, to=6.0, number_of_steps=55,
+            command=lambda v: self.extreme_sleep.set(f"{v:.1f}"), width=170
         )
         self.entry_extreme_sleep.set(float(self.extreme_sleep.get() or 2.5))
-        self.entry_extreme_sleep.pack(side=tk.LEFT, padx=5)
-        ctk.CTkLabel(mode_f, textvariable=self.extreme_sleep, width=35, font=("Arial", 14, "bold")).pack(side=tk.LEFT)
+        self.entry_extreme_sleep.pack(side=tk.LEFT, padx=6)
+        ctk.CTkLabel(sleep_f, textvariable=self.extreme_sleep, width=35,
+                     font=("Arial", 14, "bold")).pack(side=tk.LEFT)
         self.toggle_extreme_sleep_ui()
 
-        ctk.CTkLabel(parent, text="--- ADB 畫面抓取與存檔 ---", text_color="gray", font=("Arial", 14)).pack(pady=(15, 5))
-        
-        btn_ss_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_ss_frame.pack(pady=5)
-        
-        self.btn_screenshot = ctk.CTkButton(btn_ss_frame, text="📸 立即擷取模擬器畫面", height=35, command=self.test_screenshot)
-        self.btn_screenshot.pack(side=tk.LEFT, padx=5)
-        
-        self.btn_save_screenshot = ctk.CTkButton(btn_ss_frame, text="💾 儲存高畫質截圖", height=35, fg_color="#17a2b8", hover_color="#138496", state="disabled", command=self.save_screenshot)
-        self.btn_save_screenshot.pack(side=tk.LEFT, padx=5)
+        oc_f = ctk.CTkFrame(left, fg_color="transparent"); oc_f.pack(pady=PAD_ITEM, anchor="w", fill="x")
+        ctk.CTkLabel(oc_f, text="換人位於御主技能第:", font=("Arial", 14)).pack(side=tk.LEFT)
+        self.create_dropdown(oc_f, self.order_change_slot, ["1", "2", "3"], 60).pack(side=tk.LEFT, padx=6)
+        ctk.CTkLabel(oc_f, text="格 (戰鬥服為第 3 格)", text_color="gray",
+                     font=("Arial", 12)).pack(side=tk.LEFT)
 
-        ctk.CTkButton(btn_ss_frame, text="📋 開啟紀錄資料夾", height=35, width=140,
+        # ── 右欄：截圖與紀錄 ──────────────────────────
+        right = ctk.CTkFrame(wrap, fg_color=("gray95", "gray20"), corner_radius=8)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        ctk.CTkLabel(right, text="🖼️ 畫面擷取", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
+
+        self.btn_screenshot = ctk.CTkButton(right, text="📸 擷取模擬器畫面", height=34,
+                                            font=("Arial", 14), command=self.test_screenshot)
+        self.btn_screenshot.pack(pady=PAD_ITEM, padx=12, fill="x")
+
+        self.btn_save_screenshot = ctk.CTkButton(right, text="💾 儲存高畫質截圖", height=34,
+                                                 font=("Arial", 14), fg_color="#17a2b8",
+                                                 hover_color="#138496", state="disabled",
+                                                 command=self.save_screenshot)
+        self.btn_save_screenshot.pack(pady=PAD_ITEM, padx=12, fill="x")
+
+        self.lbl_image_preview = ctk.CTkLabel(right, text="(擷取後顯示於此，\n可存檔裁切作為助戰圖片)",
+                                              width=PREVIEW_SIZE[0], height=PREVIEW_SIZE[1], fg_color="#1a1a1a",
+                                              text_color="gray", corner_radius=8)
+        self.lbl_image_preview.pack(pady=PAD_BLOCK, padx=12)
+
+        ctk.CTkButton(right, text="📋 開啟紀錄資料夾", height=34, font=("Arial", 14),
                       fg_color="#6c757d", hover_color="#5a6268",
-                      command=fgo_logger.open_log_folder).pack(side=tk.LEFT, padx=5)
-        
-        self.lbl_image_preview = ctk.CTkLabel(parent, text="(截圖將顯示於此，可儲存後裁切作為助戰圖片)", width=426, height=240, fg_color="#1a1a1a", corner_radius=10)
-        self.lbl_image_preview.pack(pady=10)
+                      command=fgo_logger.open_log_folder).pack(pady=(PAD_ITEM, 12), padx=12, fill="x")
 
     # ==============================
     # ⚙️ 核心邏輯 (加入 Error 防護)
@@ -453,17 +496,108 @@ class FGOApp:
     def clear_current_script(self):
         self.script_data[self.edit_wave_idx.get()] = []; self.update_script_display()
 
-    def undo_last_script(self):
-        wave_idx = self.edit_wave_idx.get()
-        if self.script_data[wave_idx]: 
-            self.script_data[wave_idx].pop() 
-            self.update_script_display() 
+    @staticmethod
+    def format_command(c):
+        """把內部指令碼轉成看得懂的文字。
+
+        改用正規表示式逐一解析，取代原本的連續 replace —— 後者只要指令格式
+        稍微變動就可能把不該換的字元也換掉。
+        """
+        m = re.match(r'^S(\d+)(_star|_nostar)?(?:-(\d+))?$', c)
+        if m:
+            mod = {"_star": " (耗星)", "_nostar": " (不耗星)"}.get(m.group(2), "")
+            tgt = f" → 對象{m.group(3)}" if m.group(3) else ""
+            return f"技能 {m.group(1)}{mod}{tgt}"
+
+        m = re.match(r'^M(\d+)(?:-(\d+))?$', c)
+        if m:
+            tgt = f" → 對象{m.group(2)}" if m.group(2) else ""
+            return f"御主技 {m.group(1)}{tgt}"
+
+        m = re.match(r'^N(\d+)$', c)
+        if m:
+            return f"從者 {m.group(1)} 寶具"
+
+        m = re.match(r'^E(\d+)$', c)
+        if m:
+            return f"切換敵方 {m.group(1)}"
+
+        m = re.match(r'^O-(\d+)-(\d+)$', c)
+        if m:
+            return f"換人  前{m.group(1)} ⇄ 後{m.group(2)}"
+
+        return c   # 無法解析就原樣顯示，至少看得出有東西
+
+    def move_command(self, idx, delta):
+        """把第 idx 個指令往上或往下移動一格"""
+        cmds = self.script_data[self.edit_wave_idx.get()]
+        new_idx = idx + delta
+        if 0 <= new_idx < len(cmds):
+            cmds[idx], cmds[new_idx] = cmds[new_idx], cmds[idx]
+            self.update_script_display()
+
+    def delete_command(self, idx):
+        cmds = self.script_data[self.edit_wave_idx.get()]
+        if 0 <= idx < len(cmds):
+            cmds.pop(idx)
+            self.update_script_display()
+
+    def _build_script_row(self, i):
+        """建立第 i 列的元件。列的位置固定不變，所以按鈕的索引可以在建立時就綁定。"""
+        row = ctk.CTkFrame(self.script_list, fg_color=("gray92", "gray20"), corner_radius=6)
+        row.pack(fill="x", pady=2, padx=4)
+
+        lbl_no = ctk.CTkLabel(row, text=f"{i + 1}.", width=26, text_color="gray",
+                              font=("Arial", 13))
+        lbl_no.pack(side=tk.LEFT, padx=(8, 0))
+        lbl_txt = ctk.CTkLabel(row, text="", anchor="w", font=("Arial", 14))
+        lbl_txt.pack(side=tk.LEFT, padx=6, fill="x", expand=True)
+
+        btn_del = ctk.CTkButton(row, text="✕", width=30, height=26, fg_color="#C13828",
+                                hover_color="#8B2519", font=("Arial", 13, "bold"),
+                                command=lambda: self.delete_command(i))
+        btn_del.pack(side=tk.RIGHT, padx=(2, 6))
+        btn_dn = ctk.CTkButton(row, text="▼", width=30, height=26, fg_color="#4A4A4A",
+                               hover_color="#5C5C5C", font=("Arial", 13),
+                               command=lambda: self.move_command(i, 1))
+        btn_dn.pack(side=tk.RIGHT, padx=2)
+        btn_up = ctk.CTkButton(row, text="▲", width=30, height=26, fg_color="#4A4A4A",
+                               hover_color="#5C5C5C", font=("Arial", 13),
+                               command=lambda: self.move_command(i, -1))
+        btn_up.pack(side=tk.RIGHT, padx=2)
+
+        return {"row": row, "txt": lbl_txt, "up": btn_up, "down": btn_dn}
 
     def update_script_display(self):
+        """更新指令清單。
+
+        🚀 重複使用既有的列，只在數量改變時才新增或移除元件。
+           原本每次都全部銷毀重建，導致上下移動時畫面會閃爍。
+        """
         cmds = self.script_data[self.edit_wave_idx.get()]
-        readable = [c.replace('S','技').replace('M','御主').replace('O-','換人').replace('N','寶具').replace('E','敵方').replace('_star', '(耗星)').replace('_nostar', '(不耗星)') for c in cmds]
-        text = " → ".join(readable) if cmds else "(空)"
-        self.script_display.configure(text=f"目前指令：\n{text}")
+
+        # 數量不足就補、過多就砍，其餘沿用
+        while len(self._script_rows) < len(cmds):
+            self._script_rows.append(self._build_script_row(len(self._script_rows)))
+        while len(self._script_rows) > len(cmds):
+            self._script_rows.pop()["row"].destroy()
+
+        last = len(cmds) - 1
+        for i, c in enumerate(cmds):
+            r = self._script_rows[i]
+            r["txt"].configure(text=self.format_command(c))
+            r["up"].configure(state="normal" if i > 0 else "disabled")
+            r["down"].configure(state="normal" if i < last else "disabled")
+
+        # 空清單時顯示提示文字
+        if not cmds:
+            if self._empty_hint is None:
+                self._empty_hint = ctk.CTkLabel(self.script_list, text="(尚未設定任何指令)",
+                                                text_color="gray", font=("Arial", 14))
+                self._empty_hint.pack(pady=25)
+        elif self._empty_hint is not None:
+            self._empty_hint.destroy()
+            self._empty_hint = None
 
     def save_profile(self):
         try:
@@ -510,7 +644,8 @@ class FGOApp:
             'card_priority': self.card_priority.get(), 'auto_np_mode': self.auto_np_mode.get(),
             'use_roi': self.use_roi.get(),
             'use_raw_capture': self.use_raw_capture.get(),
-            'order_change_slot': self.order_change_slot.get()
+            'order_change_slot': self.order_change_slot.get(),
+            'use_tap': self.use_tap.get()
         }
 
     def _apply_profile_data(self, data):
@@ -553,6 +688,7 @@ class FGOApp:
         self.use_roi.set(data.get('use_roi', True))
         self.use_raw_capture.set(data.get('use_raw_capture', True))
         self.order_change_slot.set(str(data.get('order_change_slot', 3)))
+        self.use_tap.set(data.get('use_tap', True))
         self.script_data = data.get('script_data', [[], [], []])
         self.update_script_display()
 
@@ -647,7 +783,8 @@ class FGOApp:
                     'interlude_mode': self.interlude_mode.get(),
                     'use_roi': self.use_roi.get(),
                     'use_raw_capture': self.use_raw_capture.get(),
-                    'order_change_slot': int(self.order_change_slot.get())
+                    'order_change_slot': int(self.order_change_slot.get()),
+                    'use_tap': self.use_tap.get()
                 }
                 
                 self.session_id += 1
@@ -794,8 +931,8 @@ class FGOApp:
                 rgb = cv2.cvtColor(bot.current_screen, cv2.COLOR_BGR2RGB)
                 self.last_raw_image = Image.fromarray(rgb) 
                 
-                pil_img = self.last_raw_image.resize((426, 240), Image.LANCZOS)
-                self.ctk_preview_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(426, 240))
+                pil_img = self.last_raw_image.resize(PREVIEW_SIZE, Image.LANCZOS)
+                self.ctk_preview_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=PREVIEW_SIZE)
                 self.lbl_image_preview.configure(image=self.ctk_preview_image, text="")
                 
                 self.btn_save_screenshot.configure(state="normal")

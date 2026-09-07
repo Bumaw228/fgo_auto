@@ -1,4 +1,5 @@
 import time
+import traceback
 from fgo_core import FGOBot, print_adb_profile
 from fgo_vision import FGOVision
 from fgo_combat import FGOCombat
@@ -21,7 +22,8 @@ class FGOLogic:
         
         self.bot = FGOBot(self.config['device_id'],
                           use_roi=self.config.get('use_roi', True),
-                          use_raw_capture=self.config.get('use_raw_capture', True))
+                          use_raw_capture=self.config.get('use_raw_capture', True),
+                          use_tap=self.config.get('use_tap', True))
         
         # 🌟 啟動 Context 注入模式，將自己傳遞給各大子模組
         self.vision = FGOVision(self)
@@ -101,8 +103,14 @@ class FGOLogic:
 
         except ScriptStoppedException:
             print("🛑 收到中斷訊號，腳本瞬間安全停止！")
-        except Exception as e: 
-            print(f"Error: {e}")
+        except Exception:
+            # 🚀 印出完整 traceback，才知道是哪個檔案哪一行出事。
+            #    只印訊息的話，像「name 'f' is not defined」這種錯誤完全無從查起。
+            print("=" * 60)
+            print("❌ 腳本執行時發生未預期的錯誤")
+            traceback.print_exc()
+            print("=" * 60)
+            self.update_status("狀態：腳本發生錯誤，詳見紀錄檔", fg="red")
         finally:
             print_adb_profile()   # ⏱️ 腳本停止時輸出 ADB 耗時統計
             self.stop_cb()

@@ -61,11 +61,29 @@ ORDER_CONFIRM_BTN = (963, 940)
 ORDER_CHANGE_SLOT_DEFAULT = 3
 ORDER_CHANGE_SKILL = MASTER_SKILLS[ORDER_CHANGE_SLOT_DEFAULT]
 
+# 換人畫面：六個格子的 x 範圍（實測邊界，中心點與上方 ORDER_FRONT/BACK 一致）
+ORDER_SLOT_X = {
+    ("front", 1): (84, 327),   ("front", 2): (381, 629),   ("front", 3): (684, 932),
+    ("back", 1): (984, 1232),  ("back", 2): (1285, 1530),  ("back", 3): (1578, 1830),
+}
+# SELECT 標記出現的 y 範圍（實測 203~380，上下各放寬 40px 容錯）
+ORDER_SELECT_Y = (163, 420)
+# SELECT 標記的素材檔名。找不到此檔時會自動退回舊的亮度判斷法。
+ORDER_SELECT_ASSET = "order_select.png"
+
 # 換人確定鈕：亮度高於此值代表前後排都已選取、按鈕可按
 # 實測：未選取 100、已選取 149，取中間值兩側各留約 25 的餘裕
 ORDER_CONFIRM_BRIGHT = 125
 # 換人失敗時最多重試幾次
 ORDER_CHANGE_MAX_RETRY = 3
+
+# 點擊方式由 UI 的「加速選項 → 快速點擊」控制：
+#   開啟 = input tap（快，但按壓時間極短）
+#   關閉 = input swipe 原地不動（慢約 50~150ms，但按壓時間可控）
+#
+# 按壓時間超過這個毫秒數時，即使開啟 USE_TAP 也會改用 swipe，
+# 確保未來若真的需要長按不會被 tap 取代。
+LONG_PRESS_MS = 300
 
 # 等待動畫時，每隔幾輪才點一次空白處跳過動畫。
 # FGO 點一下就會跳過，不需要每輪都點；多點只是為了防止 lag 漏掉。
