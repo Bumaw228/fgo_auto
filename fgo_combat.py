@@ -559,7 +559,11 @@ class FGOCombat:
             self.ctx.bot.capture_screen()
             
             if self.ctx.bot.find_in_folder('system', 'attack.png', click_it=False): return "BATTLE"
-            if any(self.ctx.bot.find_in_folder('system', img) for img in ['bond_screen.png', 'exp_screen.png', 'next_btn.png']): return "RESULT"
+            # 純狀態判斷，不點擊：點在結算畫面模板的中心點是無意義的誤觸，
+            # 真正要按的 next_btn 由 handle_result_state 負責。
+            if any(self.ctx.bot.find_in_folder('system', img)
+                   for img in ['bond_screen.png', 'exp_screen.png', 'next_btn.png']):
+                return "RESULT"
             if self.ctx.bot.find_in_folder('system', 'back_btn.png', click_it=False): return "BATTLE"
         return "INIT"
 
@@ -648,7 +652,9 @@ class FGOCombat:
             if next_state == "BATTLE": self.current_wave += 1 
             return next_state
             
-        elif any(bot.find_in_folder('system', img) for img in ['bond_screen.png', 'exp_screen.png', 'drop_screen.png', 'next_btn.png']):
+        # 同上：只判斷是否進入結算，不做任何點擊
+        elif any(bot.find_in_folder('system', img)
+                 for img in ['bond_screen.png', 'exp_screen.png', 'drop_screen.png', 'next_btn.png']):
             return "RESULT"
         
         elif bot.find_in_folder('system', 'retreat_btn.png', click_it=False):

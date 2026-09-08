@@ -8,14 +8,16 @@ import cv2
 import subprocess 
 import json
 import re
-from fgo_core import FGOBot, detect_devices, list_devices
+from fgo_core import FGOBot, detect_devices, list_devices, kill_adb_server
 from fgo_logic import FGOLogic 
 from PIL import Image, ImageTk
 import ctypes
 import webbrowser
 import traceback # 🚀 新增：用來捕捉詳細錯誤訊息
-from updater import check_for_update_async, download_and_apply_async, CURRENT_VERSION
+from updater import (check_for_update_async, download_and_apply_async,
+                     CURRENT_VERSION, REPO_URL, RELEASES_URL)
 import fgo_logger
+import script_check
 
 # ==============================
 # 🚀 終極路徑解決方案：防禦 _internal 陷阱與打包路徑問題
@@ -58,6 +60,13 @@ PAD_ITEM = 4
 
 # 截圖預覽尺寸（16:9）。改這裡會同時影響版面與縮圖，兩者不會不同步。
 PREVIEW_SIZE = (320, 180)
+
+# 腳本檢查的嚴重度配色。色條與文字都用同一組，比淡底色好辨識。
+LEVEL_COLOR = {
+    "error": "#E5534B",
+    "warn": "#D9A441",
+    "info": "#4F94CD",
+}
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
@@ -116,10 +125,12 @@ class FGOApp:
         self.use_roi = tk.BooleanVar(value=True)
         self.use_raw_capture = tk.BooleanVar(value=True)
         self.use_tap = tk.BooleanVar(value=True)
+        self.kill_adb_on_exit = tk.BooleanVar(value=False)
 
         self.script_data = [[], [], []]
         self._script_rows = []      # 指令清單的列元件，重複使用以避免閃爍
-        self._empty_hint = None 
+        self._empty_hint = None
+        self._wave_issues = {}      # 當前 Wave 的檢查結果，index -> issue 
         self.target_servant_paths = [None, None, None]
         self.target_ce_paths = [None, None, None]
         self.selected_servants = [tk.StringVar(value="尚未選取") for _ in range(3)]
@@ -288,6 +299,21 @@ class FGOApp:
                                                   corner_radius=10, height=170)
         self.script_list.pack(pady=5, fill="both", expand=True, padx=10)
 
+        # 檢查結果：上排是摘要與「詳細」按鈕，下排顯示選取那一列的說明
+        chk_f = ctk.CTkFrame(parent, fg_color="transparent")
+        chk_f.pack(fill="x", padx=14, pady=(2, 0))
+        self.lbl_script_check = ctk.CTkLabel(chk_f, text="", font=("Arial", 13), anchor="w")
+        self.lbl_script_check.pack(side=tk.LEFT)
+        self.btn_check_detail = ctk.CTkButton(chk_f, text="查看全部", width=76, height=24,
+                                              font=("Arial", 12), fg_color="#4A4A4A",
+                                              hover_color="#5C5C5C", command=self.show_check_report)
+        self.btn_check_detail.pack(side=tk.RIGHT)
+
+        self.lbl_issue_detail = ctk.CTkLabel(parent, text="", font=("Arial", 12),
+                                             anchor="w", justify="left", wraplength=740,
+                                             text_color="gray")
+        self.lbl_issue_detail.pack(fill="x", padx=14, pady=(0, 2))
+
         act_btn_frame = ctk.CTkFrame(parent, fg_color="transparent"); act_btn_frame.pack(pady=2)
         ctk.CTkButton(act_btn_frame, text="🗑️ 清除本 Wave", command=self.clear_current_script,
                       fg_color="#C13828", hover_color="#8B2519",
@@ -393,6 +419,12 @@ class FGOApp:
         ctk.CTkLabel(accel_f, text="皆會自動偵測異常並退回安全模式，遇到問題可取消勾選",
                      text_color="gray", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(0, 8))
 
+        ctk.CTkCheckBox(left, text="關閉程式時一併結束 ADB 服務",
+                        variable=self.kill_adb_on_exit, font=("Arial", 14)).pack(pady=PAD_ITEM, anchor="w")
+        ctk.CTkLabel(left, text="可避免 adb.exe 殘留與更新時檔案被鎖，但會中斷其他使用 ADB 的程式",
+                     text_color="gray", font=("Arial", 11), wraplength=380,
+                     justify="left").pack(anchor="w", pady=(0, PAD_ITEM))
+
         mode_f = ctk.CTkFrame(left, fg_color="transparent"); mode_f.pack(pady=PAD_ITEM, anchor="w", fill="x")
         ctk.CTkLabel(mode_f, text="技能施放模式:", font=("Arial", 14)).pack(side=tk.LEFT)
         self.create_dropdown(mode_f, self.skill_mode, ["智慧安全", "標準無腦", "極限盲操"], 110).pack(side=tk.LEFT, padx=8)
@@ -439,7 +471,18 @@ class FGOApp:
 
         ctk.CTkButton(right, text="📋 開啟紀錄資料夾", height=34, font=("Arial", 14),
                       fg_color="#6c757d", hover_color="#5a6268",
-                      command=fgo_logger.open_log_folder).pack(pady=(PAD_ITEM, 12), padx=12, fill="x")
+                      command=fgo_logger.open_log_folder).pack(pady=PAD_ITEM, padx=12, fill="x")
+
+        ctk.CTkLabel(right, text="ℹ️ 說明與更新", font=("Arial", 14, "bold")).pack(anchor="w", padx=12, pady=(PAD_BLOCK, 2))
+
+        link_f = ctk.CTkFrame(right, fg_color="transparent")
+        link_f.pack(pady=(PAD_ITEM, 12), padx=12, fill="x")
+        ctk.CTkButton(link_f, text="🌐 專案頁面", height=34, font=("Arial", 14),
+                      fg_color="#4A4A4A", hover_color="#5C5C5C",
+                      command=lambda: webbrowser.open(REPO_URL)).pack(side=tk.LEFT, expand=True, fill="x", padx=(0, 3))
+        ctk.CTkButton(link_f, text="🔄 檢查更新", height=34, font=("Arial", 14),
+                      fg_color="#4A4A4A", hover_color="#5C5C5C",
+                      command=self.manual_check_update).pack(side=tk.LEFT, expand=True, fill="x", padx=(3, 0))
 
     # ==============================
     # ⚙️ 核心邏輯 (加入 Error 防護)
@@ -528,6 +571,43 @@ class FGOApp:
 
         return c   # 無法解析就原樣顯示，至少看得出有東西
 
+    def _show_issue_detail(self, idx):
+        """顯示某一列的檢查說明。idx 為 None 時清空。"""
+        if not hasattr(self, "lbl_issue_detail"):
+            return
+        issue = (self._wave_issues or {}).get(idx) if idx is not None else None
+        if issue is None:
+            hint = "點選任一列可查看該列的檢查說明" if self._wave_issues else ""
+            self.lbl_issue_detail.configure(text=hint, text_color="gray")
+        else:
+            self.lbl_issue_detail.configure(
+                text=f"{script_check.LEVEL_ICON[issue['level']]} 第 {idx + 1} 道：{issue['msg']}",
+                text_color=LEVEL_COLOR[issue["level"]])
+
+    def show_check_report(self):
+        """列出整份腳本的所有檢查結果"""
+        issues = script_check.check_script(self.script_data)
+        if not issues:
+            messagebox.showinfo("腳本檢查", "✅ 檢查通過，未發現問題。")
+            return
+        messagebox.showinfo(
+            "腳本檢查結果",
+            f"{script_check.summarize(issues)}\n\n{script_check.format_report(issues)}\n\n"
+            f"🔴 錯誤會導致指令失效　🟡 建議確認　🔵 僅供參考，多為需要搭配特定隊伍才成立")
+
+    def _update_check_summary(self, issues):
+        """更新清單下方的檢查摘要。整份腳本一起看，不只當前 Wave。"""
+        if not hasattr(self, "lbl_script_check"):
+            return
+        colour = "#28a745"
+        if script_check.has_error(issues):
+            colour = "#dc3545"
+        elif any(x["level"] == script_check.WARN for x in issues):
+            colour = "#ffc107"
+        elif issues:
+            colour = "#4F94CD"
+        self.lbl_script_check.configure(text=script_check.summarize(issues), text_color=colour)
+
     def move_command(self, idx, delta):
         """把第 idx 個指令往上或往下移動一格"""
         cmds = self.script_data[self.edit_wave_idx.get()]
@@ -547,11 +627,20 @@ class FGOApp:
         row = ctk.CTkFrame(self.script_list, fg_color=("gray92", "gray20"), corner_radius=6)
         row.pack(fill="x", pady=2, padx=4)
 
+        # 左側色條：比整列淡淡的底色更容易一眼看出嚴重度
+        stripe = ctk.CTkFrame(row, width=6, height=30, corner_radius=3, fg_color=("gray92", "gray20"))
+        stripe.pack(side=tk.LEFT, padx=(6, 2), pady=4)
+        stripe.pack_propagate(False)
+
         lbl_no = ctk.CTkLabel(row, text=f"{i + 1}.", width=26, text_color="gray",
                               font=("Arial", 13))
-        lbl_no.pack(side=tk.LEFT, padx=(8, 0))
+        lbl_no.pack(side=tk.LEFT, padx=(2, 0))
         lbl_txt = ctk.CTkLabel(row, text="", anchor="w", font=("Arial", 14))
         lbl_txt.pack(side=tk.LEFT, padx=6, fill="x", expand=True)
+
+        # 點任一處都能看該列的檢查說明
+        for widget in (row, lbl_no, lbl_txt, stripe):
+            widget.bind("<Button-1>", lambda e, k=i: self._show_issue_detail(k))
 
         btn_del = ctk.CTkButton(row, text="✕", width=30, height=26, fg_color="#C13828",
                                 hover_color="#8B2519", font=("Arial", 13, "bold"),
@@ -566,7 +655,8 @@ class FGOApp:
                                command=lambda: self.move_command(i, -1))
         btn_up.pack(side=tk.RIGHT, padx=2)
 
-        return {"row": row, "txt": lbl_txt, "up": btn_up, "down": btn_dn}
+        return {"row": row, "txt": lbl_txt, "up": btn_up, "down": btn_dn,
+                "no": lbl_no, "stripe": stripe}
 
     def update_script_display(self):
         """更新指令清單。
@@ -582,12 +672,34 @@ class FGOApp:
         while len(self._script_rows) > len(cmds):
             self._script_rows.pop()["row"].destroy()
 
+        # 跑一次乾跑檢查，把問題對應到各列
+        issues = script_check.check_script(self.script_data)
+        wave = self.edit_wave_idx.get()
+        by_index = {}
+        for x in issues:
+            if x["wave"] == wave and x["index"] is not None:
+                # 同一列有多個問題時，以最嚴重的為準
+                cur = by_index.get(x["index"])
+                order = {script_check.ERROR: 0, script_check.WARN: 1, script_check.INFO: 2}
+                if cur is None or order[x["level"]] < order[cur["level"]]:
+                    by_index[x["index"]] = x
+
+        self._wave_issues = by_index
+
         last = len(cmds) - 1
         for i, c in enumerate(cmds):
             r = self._script_rows[i]
-            r["txt"].configure(text=self.format_command(c))
+            issue = by_index.get(i)
+            lv = issue["level"] if issue else None
+            r["txt"].configure(text=self.format_command(c),
+                               text_color=LEVEL_COLOR.get(lv, ("gray10", "gray90")))
+            r["stripe"].configure(fg_color=LEVEL_COLOR.get(lv, ("gray92", "gray20")))
+            r["no"].configure(text=f"{i + 1}.")
             r["up"].configure(state="normal" if i > 0 else "disabled")
             r["down"].configure(state="normal" if i < last else "disabled")
+
+        self._update_check_summary(issues)
+        self._show_issue_detail(None)
 
         # 空清單時顯示提示文字
         if not cmds:
@@ -645,7 +757,8 @@ class FGOApp:
             'use_roi': self.use_roi.get(),
             'use_raw_capture': self.use_raw_capture.get(),
             'order_change_slot': self.order_change_slot.get(),
-            'use_tap': self.use_tap.get()
+            'use_tap': self.use_tap.get(),
+            'kill_adb_on_exit': self.kill_adb_on_exit.get()
         }
 
     def _apply_profile_data(self, data):
@@ -689,6 +802,7 @@ class FGOApp:
         self.use_raw_capture.set(data.get('use_raw_capture', True))
         self.order_change_slot.set(str(data.get('order_change_slot', 3)))
         self.use_tap.set(data.get('use_tap', True))
+        self.kill_adb_on_exit.set(data.get('kill_adb_on_exit', False))
         self.script_data = data.get('script_data', [[], [], []])
         self.update_script_display()
 
@@ -708,6 +822,27 @@ class FGOApp:
     # ==============================
     # 🔄 自動更新
     # ==============================
+    def manual_check_update(self):
+        """使用者主動按下的更新檢查：不論結果都要有回應。"""
+        self.update_status_label("狀態：正在檢查更新...", "orange")
+
+        def up_to_date(info):
+            self.root.after(0, lambda: (
+                self.update_status_label(f"狀態：目前已是最新版 v{CURRENT_VERSION}", "#28a745"),
+                messagebox.showinfo("檢查更新", f"目前已是最新版本 v{CURRENT_VERSION}。")))
+
+        def failed(msg):
+            self.root.after(0, lambda: (
+                self.update_status_label("狀態：無法檢查更新", "#dc3545"),
+                messagebox.showwarning(
+                    "檢查更新失敗",
+                    f"無法連線至更新伺服器（{msg}）。\n\n"
+                    f"可以直接到專案頁面查看是否有新版本：\n{RELEASES_URL}")))
+
+        check_for_update_async(
+            lambda info: self.root.after(0, lambda: self._ask_update(info)),
+            on_error=failed, on_up_to_date=up_to_date)
+
     def check_update(self):
         check_for_update_async(
             lambda info: self.root.after(0, lambda: self._ask_update(info)),
@@ -766,6 +901,21 @@ class FGOApp:
                 self.btn_start.configure(state="disabled")
                 self.btn_stop.configure(state="normal")
                 
+                # 🚀 啟動前跑一次乾跑檢查。有錯誤時詢問，但不強制阻擋 ——
+                #    使用者可能有程式沒考慮到的理由。
+                if self.battle_mode.get() == "script":
+                    issues = script_check.check_script(self.script_data)
+                    if script_check.has_error(issues):
+                        report = script_check.format_report(
+                            [x for x in issues if x["level"] != script_check.INFO])
+                        if not messagebox.askyesno(
+                                "腳本檢查發現問題",
+                                f"{script_check.summarize(issues)}\n\n{report}\n\n仍要繼續執行嗎？"):
+                            self.running = False
+                            self.btn_start.configure(state="normal")
+                            self.btn_stop.configure(state="disabled")
+                            return
+
                 try: loop_val = int(self.loop_target.get() or 0)
                 except: loop_val = 0
                 try: extreme_val = float(self.extreme_sleep.get() or 2.5)
@@ -839,6 +989,15 @@ class FGOApp:
         self.btn_stop.configure(state="disabled")
         if "任務達成" not in self.label_status.cget("text"):
             self.label_status.configure(text="狀態：已停止", text_color="#dc3545")
+
+    def on_close(self):
+        """關閉視窗時的收尾：先停腳本，需要的話再關掉 ADB 服務。"""
+        self.stop_script()
+        if self.kill_adb_on_exit.get():
+            self.update_status_label("狀態：正在關閉 ADB 服務...", "orange")
+            self.root.update()
+            kill_adb_server()
+        self.root.destroy()
 
     def set_conn_state(self, state, text):
         """更新連線指示燈。state: connected / checking / disconnected"""
@@ -970,5 +1129,5 @@ if __name__ == "__main__":
 
     root = ctk.CTk()
     app = FGOApp(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.stop_script(), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

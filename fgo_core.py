@@ -135,6 +135,27 @@ COMMON_ADB_PORTS = [
 ]
 
 
+def kill_adb_server():
+    """關閉常駐的 adb 伺服器。
+
+    ⚠️ kill-server 是全域的，會影響其他正在使用 adb 的程式
+       （scrcpy、Android Studio 等），而且模擬器通常會自己再叫起來，
+       所以預設不呼叫，由使用者在設定中決定。
+
+    值得關掉的兩個理由：
+      1. 常駐的 adb.exe 會鎖住 platform-tools 裡的檔案，讓自動更新覆蓋失敗
+      2. 使用者常反映「程式關了 adb.exe 還在」
+    """
+    try:
+        subprocess.run([ADB_EXE, "kill-server"], capture_output=True,
+                       timeout=10, creationflags=CREATE_NO_WINDOW)
+        print("🔌 [ADB] 伺服器已關閉")
+        return True
+    except Exception as e:
+        print(f"⚠️ [ADB] 關閉伺服器失敗: {e}")
+        return False
+
+
 def _run_adb(args, timeout=15):
     """執行不指定裝置的 adb 指令（devices / connect / kill-server 等）。"""
     try:
@@ -297,18 +318,8 @@ class FGOBot:
             print(f"[INIT] 無法讀取解析度，沿用預設 {self.tap_w}x{self.tap_h}")
 
     def shutdown(self):
-        """關閉 adb 伺服器。
-
-        注意：kill-server 是全域的，會影響其他正在使用 adb 的程式
-        （scrcpy、Android Studio 等），而且模擬器通常會自己再叫起來。
-        建議做成使用者可選的開關，不要無條件呼叫。
-        """
-        try:
-            subprocess.run([ADB_EXE, "kill-server"], capture_output=True,
-                           timeout=10, creationflags=CREATE_NO_WINDOW)
-            print("🔌 [ADB] 伺服器已關閉")
-        except Exception as e:
-            print(f"⚠️ [ADB] 關閉伺服器失敗: {e}")
+        """關閉 adb 伺服器（保留給既有呼叫端，實作在模組層級）"""
+        kill_adb_server()
 
     # ==========================================
     # 📸 截圖
@@ -492,10 +503,13 @@ class FGOBot:
             self.template_cache.popitem(last=False)   # 只踢掉最久沒用的一張
         return gray
 
-    def find_in_folder(self, folder_type, filename, threshold=0.8, click_it=True):
+    def find_in_folder(self, folder_type, filename, threshold=0.8, click_it=False):
         """在 assets 資料夾裡找圖。
 
-        ⚠️ click_it 預設為 True（沿用舊行為），只是「檢查」時務必明確寫 click_it=False。
+        🚀 click_it 預設為 False：這個 API 同時能「找」和「點」，
+           預設不點比較安全 —— 忘記寫參數時只是少點一下（看得出來），
+           而不是多點一下（不會報錯，但會誤觸畫面）。
+           要點擊請明確寫 click_it=True。
         """
         if not filename:
             return False
@@ -544,8 +558,8 @@ class FGOBot:
         except Exception as e:
             print(f"⚠️ [ROI] 寫入紀錄失敗: {e}")
 
-    def find_by_abspath(self, full_path, threshold=0.8, click_it=True):
-        """回傳中心點座標 (x, y)，找不到回傳 None。"""
+    def find_by_abspath(self, full_path, threshold=0.8, click_it=False):
+        """回傳中心點座標 (x, y)，找不到回傳 None。要點擊請明確寫 click_it=True。"""
         if self.current_screen_gray is None:
             return None
         template_gray = self._get_template_gray(full_path)

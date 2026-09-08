@@ -27,9 +27,13 @@ GITHUB_OWNER = "Bumaw228"
 GITHUB_REPO = "fgo_auto"
 
 # 🚀 每次發版都要改這裡，並讓 GitHub 上的 tag 一致（tag 打 v1.0.1，這裡寫 1.0.1）
-CURRENT_VERSION = "1.2.0"
+CURRENT_VERSION = "1.2.1"
 
 API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+# 專案首頁與 Release 頁，供 UI 的按鈕使用
+REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+RELEASES_URL = f"{REPO_URL}/releases"
 
 CREATE_NEW_CONSOLE = 0x00000010
 
@@ -103,8 +107,11 @@ def fetch_latest_release(timeout=10):
     }
 
 
-def check_for_update_async(on_update_available, on_error=None):
+def check_for_update_async(on_update_available, on_error=None, on_up_to_date=None):
     """背景檢查更新。
+
+    on_up_to_date 供「手動檢查更新」使用 —— 自動檢查時沒有新版就該安靜，
+    但使用者主動按下按鈕時，沒有回應會讓人以為當掉了。
 
     ⚠️ callback 是在子執行緒被呼叫的，裡面要動 UI 請用 root.after(0, ...)。
     """
@@ -113,6 +120,8 @@ def check_for_update_async(on_update_available, on_error=None):
             info = fetch_latest_release()
             if parse_version(info["version"]) > parse_version(CURRENT_VERSION):
                 on_update_available(info)
+            elif on_up_to_date:
+                on_up_to_date(info)
         except urllib.error.HTTPError as e:
             # 404 通常代表這個 repo 還沒發過 Release，屬正常情況
             if on_error:
@@ -187,13 +196,20 @@ if not errorlevel 1 (
     goto waitloop
 )
 
+echo   正在關閉背景的 ADB 服務...
+rem ADB 伺服器是常駐行程，會鎖住 platform-tools 裡的 adb.exe 與 DLL，
+rem 不先關掉的話 robocopy 會因為「檔案正在使用中」而失敗。
+taskkill /F /IM adb.exe >nul 2>&1
+timeout /t 2 /nobreak >nul
+
 echo   正在複製新版檔案...
 echo   (使用者的存檔與助戰圖片將保留不動)
-robocopy "{src}" "{dst}" /E /IS {excludes} /NFL /NDL /NJH /NJS /R:3 /W:2
+robocopy "{src}" "{dst}" /E /IS {excludes} /NFL /NDL /NJH /NJS /R:2 /W:1
 if errorlevel 8 (
     echo.
-    echo   [失敗] 檔案複製發生錯誤，可能是權限不足。
-    echo   請手動到 GitHub 下載新版，或以系統管理員身分重試。
+    echo   [部分失敗] 有檔案無法覆蓋，通常是該檔正被其他程式佔用。
+    echo   主程式多半已更新完成，可直接手動開啟 {exe} 確認版本。
+    echo   若版本沒變，請關閉模擬器與相關程式後重試，或到 GitHub 手動下載。
     echo.
     pause
     goto cleanup

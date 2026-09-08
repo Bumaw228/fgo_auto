@@ -43,7 +43,7 @@ class FGONav:
             self.ctx.smart_sleep(1.5)
             self.ctx.bot.capture_screen() 
 
-        if self.ctx.bot.find_in_folder('system', target_apple):
+        if self.ctx.bot.find_in_folder('system', target_apple, click_it=True):
             print(f"✅ 已點擊蘋果: {target_apple}")
             self.ctx.smart_sleep(1.5) 
             
@@ -224,7 +224,7 @@ class FGONav:
             return "IDLE"
 
         elif bot.find_in_folder('system', 'decide_btn.png', click_it=False):
-            bot.find_in_folder('system', 'decide_btn.png'); self.ctx.smart_sleep(2.0); return "IDLE"
+            bot.find_in_folder('system', 'decide_btn.png', click_it=True); self.ctx.smart_sleep(2.0); return "IDLE"
         elif bot.find_in_folder('system', 'support_check.png', click_it=False):
             self.swipe_count = 0; self.refresh_count = 0; return "SUPPORT"
         elif bot.find_in_folder('system', 'attack.png', click_it=False):
@@ -386,7 +386,7 @@ class FGONav:
                 if bot.find_in_folder('system', 'close_btn.png', click_it=True): self.ctx.smart_sleep(2.0); return "INIT"
                 else: self.ctx.smart_sleep(0.5); continue 
             if bot.find_in_folder('system', 'friend_request.png', click_it=False):
-                if bot.find_in_folder('system', 'reject_friend.png'): self.ctx.smart_sleep(1.5)
+                if bot.find_in_folder('system', 'reject_friend.png', click_it=True): self.ctx.smart_sleep(1.5)
                 else: self.ctx.click(*REJECT_FRIEND_FALLBACK); self.ctx.smart_sleep(1.5)
                 continue
             if bot.find_in_folder('system', 'next_btn.png', click_it=True): self.ctx.smart_sleep(0.5); continue
@@ -420,12 +420,12 @@ class FGONav:
             self.ctx.update_status(f"🎉 任務達成：已完成 {self.ctx.current_loop} 場周回！", fg="green")
             bot.capture_screen()
             if bot.find_in_folder('system', 'continue_battle.png', click_it=False):
-                if not bot.find_in_folder('system', 'close_btn.png'): self.ctx.click(*CONTINUE_BATTLE_FALLBACK)
+                if not bot.find_in_folder('system', 'close_btn.png', click_it=True): self.ctx.click(*CONTINUE_BATTLE_FALLBACK)
                 self.ctx.smart_sleep(3.0) 
             self.ctx.running = False; return "RESULT"
         else:
             bot.capture_screen() 
-            if bot.find_in_folder('system', 'continue_battle.png'):
+            if bot.find_in_folder('system', 'continue_battle.png', click_it=True):
                 self.ctx.current_loop += 1; self.ctx.smart_sleep(5); return "INIT" 
             elif bot.find_in_folder('system', 'menu_button.png', click_it=False):
                 self.ctx.current_loop += 1; self.ctx.smart_sleep(3); return "INIT" 
