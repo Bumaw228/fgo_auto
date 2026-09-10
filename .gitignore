@@ -15,6 +15,10 @@ fgo_screenshot.png
 # 開發暫存
 roi_log.csv
 debug_*.png
+cd_debug/
+
+# 給 AI 助手的專案指引，屬個人工作方式，不進版控
+CLAUDE.md
 
 .idea/
 .vscode/

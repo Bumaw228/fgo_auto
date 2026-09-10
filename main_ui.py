@@ -8,7 +8,7 @@ import cv2
 import subprocess 
 import json
 import re
-from fgo_core import FGOBot, detect_devices, list_devices, kill_adb_server
+from fgo_core import FGOBot, detect_devices, list_devices_unique, kill_adb_server
 from fgo_logic import FGOLogic 
 from PIL import Image, ImageTk
 import ctypes
@@ -960,7 +960,7 @@ class FGOApp:
                     except Exception as e:
                         err_msg = traceback.format_exc()
                         print(err_msg)
-                        self.update_status_label("狀態：腳本發生致命錯誤崩潰！", "#dc3545")
+                        self.update_status_label("❌ 狀態：腳本發生致命錯誤崩潰！", "#dc3545")
                         # 避免在子執行緒中直接彈窗導致卡死，透過 after 呼叫
                         self.root.after(0, lambda: messagebox.showerror("腳本崩潰", f"發生未預期錯誤:\n{err_msg}"))
                         self.stop_script()
@@ -984,10 +984,18 @@ class FGOApp:
         if self.logic_thread: self.logic_thread.running = False
         self.root.after(0, self._stop_script_ui)
 
+    # 停止時要保留原本訊息的開頭符號。
+    # 腳本停止的流程是 run_logic 的 finally -> stop_cb -> stop_script -> 這裡，
+    # 所以「為什麼停」的訊息一定比這裡早發生。若無條件覆蓋成「已停止」，
+    # 倉庫已滿、斷線、助戰刷新上限、結算卡死這些原因使用者就永遠看不到，
+    # 只能去翻紀錄檔。凡是帶這些符號的都是已經講清楚原因的訊息，不要蓋掉。
+    STOP_KEEP_PREFIX = ("⛔", "⚠️", "🎉", "❌")
+
     def _stop_script_ui(self):
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-        if "任務達成" not in self.label_status.cget("text"):
+        current = self.label_status.cget("text")
+        if "任務達成" not in current and not current.startswith(self.STOP_KEEP_PREFIX):
             self.label_status.configure(text="狀態：已停止", text_color="#dc3545")
 
     def on_close(self):
@@ -1009,18 +1017,22 @@ class FGOApp:
     def check_connection_async(self):
         """在背景確認目前填入的位址是否真的連得上。
 
-        只查詢不主動連線，所以很快；若填入的位址不通、而剛好只有一台裝置在線，
-        就順手帶入，省去使用者再按一次「自動偵測」。
+        不主動 connect，但會合併同一台模擬器的多個連接埠 —— 否則會出現
+        啟動時顯示「已連接 4 台」、按下自動偵測卻說 2 台的矛盾。
+        合併之後「只有一台就順手帶入」那條捷徑也才會真的生效
+        （一台 MuMu 佔三個埠時，未合併的清單長度是 3，永遠走不到那條）。
         """
         self.set_conn_state("checking", "檢查中...")
 
+        # Tk 元件只能在主執行緒存取，先在這裡取好值再交給背景執行緒
+        target = self.entry_adb.get().strip()
+
         def worker():
             try:
-                devices = list_devices()
+                devices = list_devices_unique()
             except Exception as e:
                 print(f"[連線檢查] 失敗: {e}")
                 devices = []
-            target = self.entry_adb.get().strip()
             self.root.after(0, lambda: self._apply_conn_result(devices, target))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1066,12 +1078,26 @@ class FGOApp:
 
     def _apply_detect_result(self, devices):
         if devices:
+            # 保留使用者已經選好的那台：欄位裡的值若就在偵測結果中就不覆蓋。
+            # 否則多開時按一次「自動偵測」就會被換成第一台，
+            # 腳本會跑去操作另一台模擬器而使用者毫無察覺。
+            current = self.entry_adb.get().strip()
+            pick = current if current in devices else devices[0]
+
             self.entry_adb.delete(0, tk.END)
-            self.entry_adb.insert(0, devices[0])
+            self.entry_adb.insert(0, pick)
             self.set_conn_state("connected", "已連線")
-            self.update_status_label(f"狀態：ADB 連線成功 ({devices[0]})", "#28a745")
-            extra = f"\n(共偵測到 {len(devices)} 台，已選用第一台)" if len(devices) > 1 else ""
-            messagebox.showinfo("成功", f"已連線: {devices[0]}{extra}")
+            self.update_status_label(f"狀態：ADB 連線成功 ({pick})", "#28a745")
+
+            if len(devices) > 1:
+                rows = [f"    {d}" + ("   ← 使用中" if d == pick else "")
+                        for d in devices]
+                msg = "\n".join([f"已連線: {pick}", "",
+                                  f"共偵測到 {len(devices)} 台：", *rows, "",
+                                  "要切換請直接修改上方的「ADB 連線」欄位。"])
+                messagebox.showinfo("成功", msg)
+            else:
+                messagebox.showinfo("成功", f"已連線: {pick}")
         else:
             self.set_conn_state("disconnected", "未連線")
             self.update_status_label("狀態：找不到設備，請確認模擬器設定", "#dc3545")

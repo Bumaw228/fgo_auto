@@ -10,6 +10,15 @@ from coords import SERVANT_PORTRAIT
 class ScriptStoppedException(Exception):
     pass
 
+
+# 📸 截圖連續失敗超過這麼久（秒）就判定模擬器已離線，停止腳本。
+#
+# 用「時間」而不是「次數」計算，因為兩種死法的節奏差 30 倍：
+#   模擬器已關閉 → adb 立刻回報找不到裝置，約 0.6 秒一輪
+#   模擬器凍住   → 每次 screencap 都吃滿 15 秒逾時
+# 寫成次數的話，凍住的情況要等好幾十分鐘才會觸發。
+CAPTURE_FAIL_TIMEOUT = 200
+
 class FGOLogic:
     def __init__(self, config, status_callback, stop_callback):
         self.config = config
@@ -19,6 +28,7 @@ class FGOLogic:
         self.running = True
         self.current_loop = 1
         self.current_state = "INIT"
+        self._capture_fail_since = None   # 連續截圖失敗的起始時間，成功一次就清掉
         
         self.bot = FGOBot(self.config['device_id'],
                           use_roi=self.config.get('use_roi', True),
@@ -67,8 +77,31 @@ class FGOLogic:
                 self.check_running()
                 
                 if not self.bot.capture_screen():
+                    # 截不到畫面通常代表模擬器被關掉或沒回應。
+                    # 過去只是無限重試，狀態列停在最後一次成功的文字上，
+                    # 使用者完全看不出異常 —— 這正是要避免的靜默失敗。
+                    now = time.time()
+                    if self._capture_fail_since is None:
+                        self._capture_fail_since = now
+                        print("⚠️ [截圖] 擷取失敗，開始重試（模擬器可能已關閉或無回應）")
+                    elapsed = now - self._capture_fail_since
+
+                    if elapsed >= CAPTURE_FAIL_TIMEOUT:
+                        print(f"⛔ [截圖] 連續失敗超過 {CAPTURE_FAIL_TIMEOUT} 秒，判定模擬器已離線")
+                        self.update_status(
+                            f"⛔ 狀態：連續 {int(elapsed)} 秒無法截圖，"
+                            f"模擬器可能已關閉，腳本已停止", fg="red")
+                        break
+
+                    self.update_status(
+                        f"狀態：⚠️ 截圖失敗，重試中"
+                        f"（{int(elapsed)} / {CAPTURE_FAIL_TIMEOUT} 秒）", fg="orange")
                     self.smart_sleep(0.5)
                     continue
+
+                if self._capture_fail_since is not None:
+                    print(f"✅ [截圖] 已恢復（中斷了 {time.time() - self._capture_fail_since:.0f} 秒）")
+                    self._capture_fail_since = None
 
                 # 🛑 頂層防護網：全域崩潰攔截
                 if self.bot.find_in_folder('system', 'inventory_full_close.png', click_it=True):
@@ -110,7 +143,7 @@ class FGOLogic:
             print("❌ 腳本執行時發生未預期的錯誤")
             traceback.print_exc()
             print("=" * 60)
-            self.update_status("狀態：腳本發生錯誤，詳見紀錄檔", fg="red")
+            self.update_status("❌ 狀態：腳本發生錯誤，詳見紀錄檔", fg="red")
         finally:
             print_adb_profile()   # ⏱️ 腳本停止時輸出 ADB 耗時統計
             self.stop_cb()

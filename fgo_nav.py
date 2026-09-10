@@ -10,7 +10,11 @@ from coords import (
 )
 
 # 🚀 找不到指定助戰時，最多刷新幾次就放棄（避免整夜空刷）
-MAX_SUPPORT_REFRESH = 30
+#
+# 從 30 放寬到 100：刷新本身沒有任何遊戲內成本，而稀有的助戰本來就要多賭幾輪，
+# 早早停下來反而讓使用者得回來手動重按。100 次約需 30~50 分鐘，
+# 仍然是有界的，不會真的整夜空轉。
+MAX_SUPPORT_REFRESH = 100
 
 
 class FGONav:
@@ -31,7 +35,7 @@ class FGONav:
     def handle_ap_recovery(self):
         apple_type = self.ctx.config['apple_mode']
         if apple_type == "不自動回體":
-            self.ctx.update_status("狀態：AP 不足，停止運行", fg="red")
+            self.ctx.update_status("⛔ 狀態：AP 不足，停止運行", fg="red")
             self.ctx.running = False
             return False
 
@@ -55,7 +59,7 @@ class FGONav:
                 self.ctx.click(*AP_DECIDE_FALLBACK, duration=50)
                 self.ctx.smart_sleep(1.5); self.ctx.bot.capture_screen() 
                 if not self.ctx.bot.find_in_folder('system', 'ap_recovery_check.png', click_it=False): return True
-            self.ctx.update_status("狀態：吃蘋果卡住，停止運行", fg="red")
+            self.ctx.update_status("⛔ 狀態：吃蘋果卡住，停止運行", fg="red")
             self.ctx.running = False
             return False
         return False

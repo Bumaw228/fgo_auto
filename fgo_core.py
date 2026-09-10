@@ -3,7 +3,9 @@ import sys
 import time
 import subprocess
 import re
+import socket
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 
 import cv2
@@ -135,6 +137,112 @@ COMMON_ADB_PORTS = [
 ]
 
 
+# 只給 socket 探測用的候選埠清單。
+#
+# 探測一個埠只要 11~13ms（有東西在聽）或吃滿逾時（沒有），比 adb connect 到空埠的
+# 2430ms 便宜兩個數量級，所以這份清單可以列得比 COMMON_ADB_PORTS 更廣。
+# COMMON_ADB_PORTS 維持原樣不要擴充 —— 那份是給 adb connect 逐一嘗試用的，
+# 每多一個埠就多 2.4 秒。
+PROBE_PORTS = [
+    16384, 16416, 16448, 16480, 16512,   # MuMu 12，多開每個實例 +32
+    7555,                                # MuMu 6 / 舊版
+    5555, 5557, 5559, 5561,              # 通用 / 雷電 / BlueStacks
+    62001, 62025, 62026, 62027,          # 夜神 Nox
+    21503, 21513,                        # 逍遙 MEmu
+]
+
+# 已學到是「別名」的埠：同一台模擬器的第二、第三個連接埠。
+# 連上它們只會拿到重複的裝置，學會之後就不必再連 —— 否則每次偵測都要重連一次
+# 再斷開，實測白花約 1.5 秒。
+#
+# 別名的歸屬**不是固定的**（實測 MuMu 重開後 7555 會換成屬於另一個實例），
+# 所以只要偵測到的裝置組合有變動，就把整份快取丟掉重新學，
+# 避免「某個別名埠後來變成別台模擬器的主要埠」時漏掉那台。
+_alias_ports = set()
+_alias_basis = None      # 學到這份快取時，偵測結果是哪一組裝置
+
+# socket 探測逾時。實測有在聽的埠 11~13ms 就連上，設 50ms 留約 4 倍餘裕。
+# 就算真的漏掉，後面的路徑 2／3 仍會用 adb connect 補救。
+PROBE_TIMEOUT = 0.05
+
+
+def _port_is_open(port, timeout=PROBE_TIMEOUT):
+    """本機這個埠有沒有東西在聽。連上就立刻關閉，不送出任何資料。"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _connect_listening_ports(already):
+    """對「有在聽、但 adb 還不知道」的埠做 adb connect，回傳新連上的裝置清單。
+
+    回傳清單而非數量，是為了讓呼叫端能在事後把「確認是重複別名」的那些斷開 ——
+    我們製造的連線要由我們自己收乾淨。
+
+    多開的第二、三台模擬器**不會自己註冊到 adb**，必須有人主動 connect 才看得到。
+    原本只在裝置清單全空時才掃埠，所以第一台佔住清單之後就再也找不到其他台 ——
+    使用者只能自己把埠號填進欄位。
+
+    先用 socket 篩一遍是關鍵：adb connect 到沒東西聽的埠要 2430ms，
+    掃完整份 PROBE_PORTS 要 19 秒以上；改成先探測後只連活的，整體降到約 0.3~0.8 秒。
+    """
+    known = {d.rsplit(":", 1)[-1] for d in already if ":" in d}
+    candidates = [p for p in PROBE_PORTS
+                  if str(p) not in known and p not in _alias_ports]
+    if not candidates:
+        return 0
+
+    # 探測彼此完全獨立，並行跑掉整份清單的等待時間：
+    # 逐一探測全部 16 個埠實測 1044ms，並行後只剩單一逾時的時間（約 70ms）。
+    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        listening = [p for p, ok in
+                     zip(candidates, pool.map(_port_is_open, candidates)) if ok]
+
+    added = []
+    for port in listening:
+        # connect 會改動 adb 伺服器狀態，維持逐一執行不要並行。
+        # 逾時給 6 秒：剛 kill-server 之後伺服器要重新啟動，4 秒實測不夠。
+        dev = f"127.0.0.1:{port}"
+        r = _run_adb(["connect", dev], timeout=6)
+        out = (r.stdout or "").lower()
+        # "already connected" 代表 adb 本來就知道，不算新發現
+        if "connected to" in out and "already" not in out:
+            print(f"[偵測] 新連上 {dev}")
+            added.append(dev)
+    return added
+
+
+def _disconnect_aliases(added, kept):
+    """把我們自己連上、但事後確認是重複別名的連線斷開。
+
+    每次 adb connect 成功，adb 伺服器就會永久記住那條連線。模擬器常同時在多個埠上聽
+    （實測 MuMu 的 5555 / 5557 / 7555 都是別名），全部留著的話裝置清單會隨每次偵測
+    越積越多 —— 不只汙染機器上其他工具看到的清單，也讓往後每一次驗證都要多問好幾台。
+
+    只斷開這一輪自己新連上的。原本就在清單裡的（`known` 會跳過，不會進 added）
+    一律不碰，因為那可能是使用者或其他工具建立的。
+    """
+    global _alias_basis
+
+    # 裝置組合變了就重新學：先前記下的別名歸屬可能已經不成立
+    basis = frozenset(kept)
+    if basis != _alias_basis:
+        _alias_ports.clear()
+        _alias_basis = basis
+
+    extra = [d for d in added if d not in kept]
+    if not extra:
+        return
+    for d in extra:
+        _run_adb(["disconnect", d], timeout=4)
+        port = d.rsplit(":", 1)[-1]
+        if port.isdigit():
+            _alias_ports.add(int(port))     # 記住，下次不必再連
+    print(f"[偵測] 已斷開 {len(extra)} 個重複的別名連接埠：{', '.join(extra)}")
+
+
 def kill_adb_server():
     """關閉常駐的 adb 伺服器。
 
@@ -183,29 +291,62 @@ def list_devices():
     return devices
 
 
+def list_devices_unique():
+    """列出裝置，並把同一台模擬器的多個連接埠合併成一筆。
+
+    給 UI 的啟動檢查用。它跟 list_devices() 一樣不主動 connect，
+    但必須跟「自動偵測」報出一致的台數 —— 否則會出現啟動時說 4 台、
+    按下自動偵測卻說 2 台的矛盾。單台時 _verify 會短路，成本為零。
+    """
+    return _verify(list_devices())
+
+
 def detect_devices(status_cb=None):
     """自動偵測模擬器，供 UI 的「自動偵測」按鈕使用。
 
     依序嘗試：直接列舉 → 主動連線常見埠 → 重啟 adb 伺服器後再試。
     status_cb 是選用的回呼，用來即時更新 UI 文字。
+
+    三條路徑的出口都會過 _verify()。呼叫端（UI 的「自動偵測」）是直接取 devices[0]
+    填進欄位並顯示「已連線」，所以清單第一筆若是殘留的死連線，使用者會看到綠字卻
+    怎麼跑都失敗；而同一台模擬器佔多個埠時，不合併會讓 UI 謊報台數。
     """
     def report(msg):
         print(f"[偵測] {msg}")
         if status_cb:
             status_cb(msg)
 
-    devices = list_devices()
-    if devices:
-        return devices
+    added = []      # 這一輪由我們主動連上的，事後要把多餘的收掉
 
-    # 有些模擬器不會自動註冊，必須主動 connect 才看得到
+    def verified(found):
+        # 單筆不需要驗證（見 _verify 的說明），所以也不用告知使用者在等什麼
+        if len(found) > 1:
+            report(f"偵測到 {len(found)} 筆連線，正在確認...")
+        result = _verify(found)
+        _disconnect_aliases(added, result)
+        return result
+
+    devices = list_devices()
+
+    # 不論清單是否已有裝置，都先掃一次沒連上的埠。
+    # 多開的第二、三台不會自己註冊到 adb，而原本只在清單全空時才掃，
+    # 等於第一台一出現就再也找不到其他台。靠 socket 預篩，這一步約 0.3~0.8 秒。
+    report("搜尋模擬器...")
+    added = _connect_listening_ports(devices)
+    if added:
+        devices = list_devices()
+
+    if devices:
+        return verified(devices)
+
+    # 後備：socket 探測不到、但 adb connect 得到的情況（例如非 PROBE_PORTS 的埠）
     report("嘗試連線常見模擬器連接埠...")
     for port in COMMON_ADB_PORTS:
         # 連得上的埠通常 1 秒內就回應，逾時設短一點避免累積等待
         _run_adb(["connect", port], timeout=4)
     devices = list_devices()
     if devices:
-        return devices
+        return verified(devices)
 
     # 最後手段：重啟伺服器（版本衝突時通常能救回來）
     report("重置 ADB 伺服器中...")
@@ -213,17 +354,57 @@ def detect_devices(status_cb=None):
     _run_adb(["start-server"], timeout=20)
     for port in COMMON_ADB_PORTS:
         _run_adb(["connect", port], timeout=4)
-    return _verify(list_devices())
+    return verified(list_devices())
+
+# android_id 是 16 個十六進位字元，自成一行。用它辨識「這兩個連接埠是不是同一台」。
+# 取不到時（回 null 或空）就不合併，寧可多列一筆，也不要把兩台真的模擬器併掉。
+_ANDROID_ID_RE = re.compile(r'^[0-9a-f]{16}$')
+# wm size 的正常輸出是 "Physical size: 1080x1920"，用這個樣式判斷裝置有沒有回應。
+# 不能只檢查字串裡有沒有 "x" —— 同一次呼叫還會帶回 android_id，太容易誤判。
+_WM_SIZE_RE = re.compile(r'[0-9]+x[0-9]+')
+
 
 def _verify(devices):
-    """實際驗證每台裝置是否真的能用，排除殘留的死連線。"""
+    """驗證每個連線是否真的通，並把同一台模擬器的多個連接埠合併成一筆。
+
+    **為什麼要驗證**：`adb devices` 的狀態是 adb 伺服器自己的記帳，不是即時探測 ——
+    模擬器被關掉後，連線可能仍被列為 device。實際送一次指令才分得出來。
+
+    **為什麼要合併**：模擬器常同時在多個埠上聽同一個實例。實測一台 MuMu 會同時出現在
+    16384 / 5555 / 7555 三個埠，三者的 android_id 完全相同；而第二台 MuMu 在 16416，
+    android_id 不同。不合併的話 UI 會顯示「偵測到 3 台」，但其實只有一台。
+
+    兩件事共用同一次 shell 呼叫（wm size 與 android_id 一起取回），所以合併是免費的。
+
+    只有兩筆以上才真的驗證：單筆時就算驗不過，結尾的 `alive or devices` 也會把它原封不動
+    還回去，結果完全一樣，等於白等一次逾時。絕大多數使用者是單台模擬器，這條短路讓他們
+    完全不必付這個成本，也保證單台永遠不會被誤判剔除。
+
+    逾時維持 6 秒不縮短：這兩個指令雖然很輕，但模擬器正在跑動畫、滿載時未必來得及回應，
+    縮短只會換來新的誤判。
+    """
+    if len(devices) <= 1:
+        return devices
+
     alive = []
+    seen = {}      # android_id -> 已經留下來的那個連接埠
     for d in devices:
-        r = _run_adb(["-s", d, "shell", "wm", "size"], timeout=6)
-        if r.stdout and "x" in r.stdout:
-            alive.append(d)
-        else:
+        r = _run_adb(["-s", d, "shell", "wm size; settings get secure android_id"], timeout=6)
+        # splitlines 同時處理 CRLF 與 LF，不必自己清換行字元
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines()]
+
+        if not any(_WM_SIZE_RE.search(ln) for ln in lines):
             print(f"[偵測] {d} 無回應，已排除")
+            continue
+
+        aid = next((ln for ln in lines if _ANDROID_ID_RE.match(ln)), None)
+        if aid is not None and aid in seen:
+            print(f"[偵測] {d} 與 {seen[aid]} 是同一台模擬器的不同連接埠，已合併")
+            continue
+        if aid is not None:
+            seen[aid] = d
+        alive.append(d)
+
     return alive or devices   # 全部都不通的話還是回傳原清單，讓使用者自己試
 
 
