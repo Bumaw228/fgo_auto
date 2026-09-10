@@ -20,6 +20,11 @@ cd_debug/
 # 給 AI 助手的專案指引，屬個人工作方式，不進版控
 CLAUDE.md
 
+# 打包用的 adb 三件套（8MB 二進位，不進版控，缺了 build.py 會明確報錯）
+adb.exe
+AdbWinApi.dll
+AdbWinUsbApi.dll
+
 .idea/
 .vscode/
 .DS_Store
